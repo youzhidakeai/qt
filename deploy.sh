@@ -27,6 +27,13 @@ cargo build --release
 # 3. 部署二进制文件
 echo "📂 正在配置部署目录: $DEPLOY_DIR"
 sudo mkdir -p "$DEPLOY_DIR"
+
+# ⚠️ 关键修复：先停止正在运行的服务，释放文件句柄，避免 Text file busy 错误
+if systemctl is-active --quiet ${SERVICE_NAME%.*}; then
+    echo "🛑 正在停止旧版本服务..."
+    sudo systemctl stop ${SERVICE_NAME%.*}
+fi
+
 sudo cp "target/release/$APP_NAME" "$DEPLOY_DIR/"
 
 # 将 .env 文件也拷贝过去，供程序读取
