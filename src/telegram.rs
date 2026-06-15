@@ -16,9 +16,9 @@ use crate::SymbolContext;
 enum Command {
     #[command(description = "显示帮助信息")]
     Help,
-    #[command(description = "狙击做多。用法: /buy <交易对> <USDT本金> <杠杆> (例: /buy ETHUSDT 500 10)")]
+    #[command(description = "狙击做多。用法: /buy &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆&gt; (例: /buy ETHUSDT 500 10)")]
     Buy(String),
-    #[command(description = "狙击做空。用法: /sell <交易对> <USDT本金> <杠杆>")]
+    #[command(description = "狙击做空。用法: /sell &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆&gt;")]
     Sell(String),
     #[command(description = "紧急清仓某个币种。用法: /panic DOGEUSDT")]
     Panic(String),
@@ -60,7 +60,7 @@ async fn answer(
 ) -> ResponseResult<()> {
     match cmd {
         Command::Help => {
-            bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;
+            bot.send_message(msg.chat.id, Command::descriptions().to_string()).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
         Command::Price => {
             let mut report = String::from("📈 实时盘口询价反馈\n\n");
@@ -75,13 +75,13 @@ async fn answer(
                     
                     if best_bid > Decimal::ZERO && best_ask > Decimal::ZERO {
                         let mid = (best_bid + best_ask) / dec!(2);
-                        report.push_str(&format!("🔹 **{}**: {:.5}\n    买一: {} | 卖一: {}\n", sym, mid, best_bid, best_ask));
+                        report.push_str(&format!("🔹 <b>{}</b>: {:.5}\n    买一: {} | 卖一: {}\n", sym, mid, best_bid, best_ask));
                     } else {
-                        report.push_str(&format!("🔹 **{}**: 深度数据获取中...\n", sym));
+                        report.push_str(&format!("🔹 <b>{}</b>: 深度数据获取中...\n", sym));
                     }
                 }
             }
-            bot.send_message(msg.chat.id, report).await?;
+            bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
         Command::Yesterday => {
             use time::{OffsetDateTime, UtcOffset, Duration, Time};
@@ -116,27 +116,27 @@ async fn answer(
                         
                         let net_income = total_pnl + total_fee + total_funding;
                         let report = format!(
-                            "📊 **昨日盈亏总结 (UTC+8)**\n\n\
+                            "📊 <b>昨日盈亏总结 (UTC+8)</b>\n\n\
                             区间: {} 00:00 ~ 23:59\n\
                             \n\
-                            💰 净收益: **{:.2} USDT**\n\
+                            💰 净收益: <b>{:.2} USDT</b>\n\
                             -------------------------\n\
                             📈 实现盈亏: {:.2} USDT\n\
                             📉 交易手续费: {:.2} USDT\n\
                             ⏱ 资金费率: {:.2} USDT",
                             start_of_yesterday.date(), net_income, total_pnl, total_fee, total_funding
                         );
-                        bot.send_message(msg.chat.id, report).await?;
+                        bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
                         return Ok(());
                     }
                 }
             }
-            bot.send_message(msg.chat.id, "❌ 获取昨日盈亏数据失败，可能是 API 调用限制或无数据。").await?;
+            bot.send_message(msg.chat.id, "❌ 获取昨日盈亏数据失败，可能是 API 调用限制或无数据。").parse_mode(teloxide::types::ParseMode::Html).await?;
         }
         Command::Buy(args) => {
             let parts: Vec<&str> = args.split_whitespace().collect();
             if parts.len() != 3 {
-                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /buy <交易对> <USDT本金> <杠杆倍数>\n例如: /buy ETHUSDT 500 10").await?;
+                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /buy &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆倍数&gt;\n例如: /buy ETHUSDT 500 10").parse_mode(teloxide::types::ParseMode::Html).await?;
                 return Ok(());
             }
             let symbol = parts[0].to_uppercase();
@@ -178,18 +178,18 @@ async fn answer(
                             fill_price,
                         }).await;
                         
-                        bot.send_message(msg.chat.id, format!("✅ {} 做多成功！\n真实成交均价 (Fill Price): {}\n已写入硬盘并挂载移动止损。", symbol, fill_price)).await?;
+                        bot.send_message(msg.chat.id, format!("✅ {} 做多成功！\n真实成交均价 (Fill Price): {}\n已写入硬盘并挂载移动止损。", symbol, fill_price)).parse_mode(teloxide::types::ParseMode::Html).await?;
                     }
-                    Err(e) => { bot.send_message(msg.chat.id, format!("❌ 订单失败：\n{}", e)).await?; }
+                    Err(e) => { bot.send_message(msg.chat.id, format!("❌ 订单失败：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
                 }
             } else {
-                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).await?;
+                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             }
         }
         Command::Sell(args) => {
             let parts: Vec<&str> = args.split_whitespace().collect();
             if parts.len() != 3 {
-                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /sell <交易对> <USDT本金> <杠杆倍数>\n例如: /sell ETHUSDT 500 10").await?;
+                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /sell &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆倍数&gt;\n例如: /sell ETHUSDT 500 10").parse_mode(teloxide::types::ParseMode::Html).await?;
                 return Ok(());
             }
             let symbol = parts[0].to_uppercase();
@@ -230,21 +230,21 @@ async fn answer(
                             fill_price,
                         }).await;
                         
-                        bot.send_message(msg.chat.id, format!("✅ {} 做空成功！\n真实成交均价 (Fill Price): {}\n已写入硬盘并挂载移动止损。", symbol, fill_price)).await?;
+                        bot.send_message(msg.chat.id, format!("✅ {} 做空成功！\n真实成交均价 (Fill Price): {}\n已写入硬盘并挂载移动止损。", symbol, fill_price)).parse_mode(teloxide::types::ParseMode::Html).await?;
                     }
-                    Err(e) => { bot.send_message(msg.chat.id, format!("❌ 订单失败：\n{}", e)).await?; }
+                    Err(e) => { bot.send_message(msg.chat.id, format!("❌ 订单失败：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
                 }
             } else {
-                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).await?;
+                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             }
         }
         Command::Panic(args) => {
             let symbol = args.trim().to_uppercase();
             if let Some(ctx) = contexts.get(&symbol) {
                 let _ = ctx.control_tx.send(ControlMessage::ClearPosition).await;
-                bot.send_message(msg.chat.id, format!("✅ {} 大脑仓位已被清零，终止移动止损保护。", symbol)).await?;
+                bot.send_message(msg.chat.id, format!("✅ {} 大脑仓位已被清零，终止移动止损保护。", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             } else {
-                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).await?;
+                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             }
         }
         Command::Status => {
@@ -270,24 +270,24 @@ async fn answer(
                                 let can_trade = json.get("canTrade").and_then(|v| v.as_bool()).unwrap_or(true); // default to true if missing
                                 let status_icon = if can_trade { "✅" } else { "❌(被禁用)" };
                                 
-                                format!("📊 **实盘资产报告 (测试网)**\n\n💰 **钱包总余额**: {} USDT\n💵 **可用开仓金**: {} USDT\n📈 **未实现盈亏**: {} USDT\n🔓 **API 交易权限**: {}", 
+                                format!("📊 <b>实盘资产报告 (测试网)</b>\n\n💰 <b>钱包总余额</b>: {} USDT\n💵 <b>可用开仓金</b>: {} USDT\n📈 <b>未实现盈亏</b>: {} USDT\n🔓 <b>API 交易权限</b>: {}", 
                                     balance, avail, unpnl, status_icon)
                             }
                         }
                         Err(e) => format!("❌ 解析数据失败: {}\n原始数据: {}", e, resp),
                     };
-                    bot.send_message(msg.chat.id, formatted).await?;
+                    bot.send_message(msg.chat.id, formatted).parse_mode(teloxide::types::ParseMode::Html).await?;
                 }
-                Err(e) => { bot.send_message(msg.chat.id, format!("⚠️ API 鉴权未通过：\n{}", e)).await?; }
+                Err(e) => { bot.send_message(msg.chat.id, format!("⚠️ API 鉴权未通过：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
             }
         }
         Command::Pnl => {
-            bot.send_message(msg.chat.id, "📡 正在扫描全网持仓与未实现收益...").await?;
+            bot.send_message(msg.chat.id, "📡 正在扫描全网持仓与未实现收益...").parse_mode(teloxide::types::ParseMode::Html).await?;
             let res = exec_client.check_positions().await;
             match res {
                 Ok(resp) => {
                     if let Ok(json_arr) = serde_json::from_str::<Vec<serde_json::Value>>(&resp) {
-                        let mut pnl_text = String::from("📈 **全网持仓与收益雷达**\n\n");
+                        let mut pnl_text = String::from("📈 <b>全网持仓与收益雷达</b>\n\n");
                         let mut has_position = false;
                         let mut total_unpnl: f64 = 0.0;
                         
@@ -306,10 +306,10 @@ async fn answer(
                                 
                                 let direction = if amt > 0.0 { "🟢 多头 (LONG)" } else { "🔴 空头 (SHORT)" };
                                 pnl_text.push_str(&format!(
-                                    "**{}** {}\n\
+                                    "<b>{}</b> {}\n\
                                      🔹 持仓量: {}\n\
                                      🔹 开仓价: {}\n\
-                                     💵 未实现盈亏: **{} USDT**\n\n",
+                                     💵 未实现盈亏: <b>{} USDT</b>\n\n",
                                      symbol, direction, amt_str, entry, unpnl_str
                                 ));
                             }
@@ -318,15 +318,15 @@ async fn answer(
                         if !has_position {
                             pnl_text.push_str("🈳 当前没有任何持仓。等待猎物出现...");
                         } else {
-                            pnl_text.push_str(&format!("💰 **总未实现盈亏: {:.4} USDT**", total_unpnl));
+                            pnl_text.push_str(&format!("💰 <b>总未实现盈亏: {:.4} USDT</b>", total_unpnl));
                         }
                         
-                        bot.send_message(msg.chat.id, pnl_text).await?;
+                        bot.send_message(msg.chat.id, pnl_text).parse_mode(teloxide::types::ParseMode::Html).await?;
                     } else {
-                        bot.send_message(msg.chat.id, "⚠️ 解析持仓数据失败。").await?;
+                        bot.send_message(msg.chat.id, "⚠️ 解析持仓数据失败。").parse_mode(teloxide::types::ParseMode::Html).await?;
                     }
                 }
-                Err(e) => { bot.send_message(msg.chat.id, format!("⚠️ API 获取持仓失败：\n{}", e)).await?; }
+                Err(e) => { bot.send_message(msg.chat.id, format!("⚠️ API 获取持仓失败：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
             }
         }
     }

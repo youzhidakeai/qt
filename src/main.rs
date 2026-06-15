@@ -69,7 +69,7 @@ async fn main() {
     let bot_notifier = Bot::from_env();
     tokio::spawn(async move {
         while let Some(msg) = tg_rx.recv().await {
-            let _ = bot_notifier.send_message(ChatId(tg_chat_id), msg).await;
+            let _ = bot_notifier.send_message(ChatId(tg_chat_id), msg).parse_mode(teloxide::types::ParseMode::Html).await;
         }
     });
     // ==========================================
@@ -167,7 +167,7 @@ async fn main() {
         let mut last_prices: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
         loop {
             interval.tick().await;
-            let mut report = String::from("⏱️ **[行情 5 分钟雷达扫瞄]**\n\n");
+            let mut report = String::from("⏱️ <b>[行情 5 分钟雷达扫瞄]</b>\n\n");
             let mut sym_keys: Vec<&String> = tg_ctx_ticker.keys().collect();
             sym_keys.sort(); // 保持固定的字母顺序
             
@@ -216,9 +216,9 @@ async fn main() {
                     }
                     if price > Decimal::ZERO {
                         last_prices.insert((*sym).clone(), price);
-                        report.push_str(&format!("🔹 **{}**: {}{}{}\n", sym, price, delta_str, extra_info));
+                        report.push_str(&format!("🔹 <b>{}</b>: {}{}{}\n", sym, price, delta_str, extra_info));
                     } else {
-                        report.push_str(&format!("🔹 **{}**: 数据获取中...\n", sym));
+                        report.push_str(&format!("🔹 <b>{}</b>: 数据获取中...\n", sym));
                     }
                 }
             }
@@ -280,10 +280,10 @@ async fn main() {
                         
                         let net_income = total_pnl + total_fee + total_funding;
                         let report = format!(
-                            "⏰ **零点播报** 📊 **昨日盈亏总结 (UTC+8)**\n\n\
+                            "⏰ <b>零点播报</b> 📊 <b>昨日盈亏总结 (UTC+8)</b>\n\n\
                             区间: {} 00:00 ~ 23:59\n\
                             \n\
-                            💰 净收益: **{:.2} USDT**\n\
+                            💰 净收益: <b>{:.2} USDT</b>\n\
                             -------------------------\n\
                             📈 实现盈亏: {:.2} USDT\n\
                             📉 交易手续费: {:.2} USDT\n\
@@ -340,7 +340,7 @@ pub async fn run_hourly_report(exec_client: Arc<BinanceExecutionClient>, tg_tx: 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
         
-        let mut report = String::from("📊 **机构级量化数据监控仓** (每小时快照)\n\n");
+        let mut report = String::from("📊 <b>机构级量化数据监控仓</b> (每小时快照)\n\n");
         
         if let Ok(account_str) = exec_client.check_account().await {
             if let Ok(account) = serde_json::from_str::<serde_json::Value>(&account_str) {
@@ -351,7 +351,7 @@ pub async fn run_hourly_report(exec_client: Arc<BinanceExecutionClient>, tg_tx: 
             }
         }
 
-        report.push_str("⚔️ **当前前线持仓**:\n");
+        report.push_str("⚔️ <b>当前前线持仓</b>:\n");
         let mut has_positions = false;
         if let Ok(pos_str) = exec_client.check_positions().await {
             if let Ok(positions) = serde_json::from_str::<Vec<serde_json::Value>>(&pos_str) {

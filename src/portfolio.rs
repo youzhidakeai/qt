@@ -116,7 +116,7 @@ impl PortfolioManager {
                         let trade_qty = if largest_pos_side == "BUY" { qty_to_reduce } else { -qty_to_reduce };
                         let _ = tx.send(ControlMessage::TradeExecuted { trade_qty, fill_price }).await;
                     }
-                    let _ = self.tg_tx.send(format!("🔪 **中央大脑资金调配**\n为了执行 {} 的 S 级信号，已强行平掉 {} 的 30% 仓位腾出保证金！", signal.symbol, largest_pos_sym)).await;
+                    let _ = self.tg_tx.send(format!("🔪 <b>中央大脑资金调配</b>\n为了执行 {} 的 S 级信号，已强行平掉 {} 的 30% 仓位腾出保证金！", signal.symbol, largest_pos_sym)).await;
                 }
             }
         }
@@ -140,7 +140,7 @@ impl PortfolioManager {
                     let trade_qty = if side == "BUY" { target_qty } else { -target_qty };
                     let _ = tx.send(ControlMessage::TradeExecuted { trade_qty, fill_price: actual_entry }).await;
                 }
-                let _ = self.tg_tx.send(format!("🤖 **中央大脑联合执行**\n✅ 交易对: {}\n🎯 方向: {}\n💰 真实均价: {}\n📦 下单量: {}", symbol, side, actual_entry, target_qty)).await;
+                let _ = self.tg_tx.send(format!("🤖 <b>中央大脑联合执行</b>\n✅ 交易对: {}\n🎯 方向: {}\n💰 真实均价: {}\n📦 下单量: {}", symbol, side, actual_entry, target_qty)).await;
             }
             Err(e) => {
                 error!("中央大脑执行 {} 失败: {}", symbol, e);
