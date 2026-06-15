@@ -28,6 +28,13 @@ cargo build --release
 echo "📂 正在配置部署目录: $DEPLOY_DIR"
 sudo mkdir -p "$DEPLOY_DIR"
 sudo cp "target/release/$APP_NAME" "$DEPLOY_DIR/"
+
+# 将 .env 文件也拷贝过去，供程序读取
+if [ -f ".env" ]; then
+    echo "📄 发现 .env 配置文件, 正在同步到部署目录..."
+    sudo cp .env "$DEPLOY_DIR/"
+fi
+
 sudo chown -R $USER:$USER "$DEPLOY_DIR" # 根据需要更改权限
 sudo chmod +x "$DEPLOY_DIR/$APP_NAME"
 

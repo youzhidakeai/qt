@@ -21,10 +21,8 @@ RestartSec=3
 # ==========================================
 # 环境变量隔离配置
 # ==========================================
-Environment="BINANCE_API_KEY=8FiJUfIyXOV3nR1Rx3YYL8yVJGpY67JrS8gukccsYapkUVRMV2cU8j0rNcu49sZX"
-Environment="BINANCE_API_SECRET=F1YwwOM4Z5qQOAhLndBS1T8VTcNIT7nz1Lz3cO7WarylXHzF11rxsArg8hK9oqff"
-Environment="TELOXIDE_TOKEN=8791598021:AAGdtXRRLS6Y1aP8dc0feoQnK6heekQFKW4"
-Environment="RUST_LOG=info"
+# 使用 EnvironmentFile 动态读取 .env 文件，而不是硬编码
+EnvironmentFile=/opt/matrix-quant/.env
 
 # ==========================================
 # HFT 极限性能调优
