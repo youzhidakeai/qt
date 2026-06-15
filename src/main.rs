@@ -388,7 +388,7 @@ pub async fn run_ml_hot_reload(redis_client: redis::Client) {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         
-        if let Ok(mut con) = redis_client.get_async_connection().await {
+        if let Ok(mut con) = redis_client.get_multiplexed_async_connection().await {
             if let Ok(weights_json) = con.get::<_, String>("ML_WEIGHTS").await {
                 if let Ok(new_nn) = serde_json::from_str::<crate::ml_engine::NeuralNetwork>(&weights_json) {
                     // 原子化热重载权重矩阵！(Nano-second Lock-Free Swap)

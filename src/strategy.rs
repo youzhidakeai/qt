@@ -3,7 +3,6 @@ use rust_decimal_macros::dec;
 use serde::{Serialize, Deserialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::fs;
 use tokio::sync::mpsc;
 use tracing::{info, error};
 
@@ -68,7 +67,9 @@ pub struct StrategyEngine {
     pub taker_sell_flow: Decimal,
 
     // 全自动实盘扣款参数 (测试网可以随便填)
+    #[allow(dead_code)]
     pub auto_margin_usdt: Decimal, 
+    #[allow(dead_code)]
     pub auto_leverage: u32,
     
     // Telegram 推送通道
