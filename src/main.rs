@@ -304,9 +304,9 @@ async fn main() {
     info!("系统正在关闭...");
 }
 
-// 从币安测试网拉取真实成交额最高的合约币种
+// 从币安主网 (Mainnet) 拉取真实成交额最高的合约币种，从而避开测试网上产生的那些诸如 JELLYJELLY 的垃圾假币
 async fn fetch_top_symbols(limit: usize) -> Vec<String> {
-    let url = "https://testnet.binancefuture.com/fapi/v1/ticker/24hr";
+    let url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
     let client = reqwest::Client::new();
     if let Ok(resp) = client.get(url).send().await {
         if let Ok(text) = resp.text().await {
