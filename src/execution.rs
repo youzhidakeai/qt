@@ -1,0 +1,166 @@
+use reqwest::Client;
+use hmac::{Hmac, Mac, KeyInit};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
+use rust_decimal::Decimal;
+use std::str::FromStr;
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub struct BinanceExecutionClient {
+    api_key: String,
+    api_secret: String,
+    client: Client,
+    base_url: String,
+}
+
+impl BinanceExecutionClient {
+    pub fn new(api_key: &str, api_secret: &str) -> Self {
+        Self {
+            api_key: api_key.to_string(),
+            api_secret: api_secret.to_string(),
+            client: Client::new(),
+            // 切换到币安 U本位合约 测试网 (Testnet) 端点
+            base_url: "https://testnet.binancefuture.com".to_string(), 
+        }
+    }
+
+    fn generate_signature(&self, payload: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    // 设置杠杆倍数
+    pub async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), String> {
+        let endpoint = "/fapi/v1/leverage";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        
+        let payload = format!("symbol={}&leverage={}&recvWindow=60000&timestamp={}", symbol, leverage, timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            let error_text = res.text().await.unwrap_or_default();
+            Err(format!("设置杠杆失败: {}", error_text))
+        }
+    }
+
+    // 下单并返回真实的成交均价 (Fill Price)
+    pub async fn place_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        order_type: &str,
+        quantity: &str,
+        reduce_only: bool,
+    ) -> Result<Decimal, String> {
+        let endpoint = "/fapi/v1/order";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+
+        let payload = format!(
+            "symbol={}&side={}&type={}&quantity={}&reduceOnly={}&recvWindow=60000&timestamp={}",
+            symbol, side, order_type, quantity, reduce_only, timestamp
+        );
+
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = res.status();
+        let text = res.text().await.map_err(|e| e.to_string())?;
+
+        if status.is_success() {
+            // 解析返回的 JSON 获取真正的成交均价 avgPrice
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            if let Some(avg_price_str) = v["avgPrice"].as_str() {
+                let avg_price = Decimal::from_str(avg_price_str).unwrap_or_default();
+                if avg_price > Decimal::ZERO {
+                    return Ok(avg_price);
+                }
+            }
+            Ok(Decimal::ZERO)
+        } else {
+            Err(format!("下单失败: {}", text))
+        }
+    }
+
+    pub async fn check_account(&self) -> Result<String, reqwest::Error> {
+        let endpoint = "/fapi/v2/account";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let payload = format!("recvWindow=60000&timestamp={}", timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+
+        res.text().await
+    }
+
+    pub async fn check_positions(&self) -> Result<String, reqwest::Error> {
+        let endpoint = "/fapi/v2/positionRisk";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let payload = format!("recvWindow=60000&timestamp={}", timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+
+        res.text().await
+    }
+
+    pub async fn get_income_history(&self, start_time: u64, end_time: u64) -> Result<String, reqwest::Error> {
+        let endpoint = "/fapi/v1/income";
+        let payload = format!("startTime={}&endTime={}&limit=1000&recvWindow=60000&timestamp={}", 
+            start_time, end_time, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+
+        res.text().await
+    }
+
+    pub async fn fetch_funding_rate(&self, symbol: &str) -> Result<Decimal, String> {
+        let endpoint = "/fapi/v1/premiumIndex";
+        let url = format!("{}{}?symbol={}", self.base_url, endpoint, symbol);
+
+        let res = self.client.get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if res.status().is_success() {
+            let text = res.text().await.map_err(|e| e.to_string())?;
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            if let Some(rate_str) = v["lastFundingRate"].as_str() {
+                return Ok(Decimal::from_str(rate_str).unwrap_or_default());
+            }
+            Ok(Decimal::ZERO)
+        } else {
+            Err(format!("获取资金费率失败: {:?}", res.status()))
+        }
+    }
+}

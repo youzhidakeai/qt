@@ -4,3 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arc-swap = "1.9.1"
+dotenvy = "0.15.7"
+futures-util = "0.3.32"
+hex = "0.4.3"
+hmac = "0.13.0"
+lazy_static = "1.5.0"
+redis = { version = "0.27", features = ["tokio-comp"] }
+reqwest = { version = "0.13.4", features = ["json"] }
+rust_decimal = { version = "1.42.1", features = ["serde"] }
+rust_decimal_macros = "1.40.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+teloxide = { version = "0.17.0", features = ["macros"] }
+time = { version = "0.3.49", features = ["formatting", "macros"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
+url = "2.5.8"
+

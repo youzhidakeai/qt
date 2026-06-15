@@ -1,0 +1,38 @@
+[Unit]
+Description=Matrix Quantitative Trading Engine (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 建议替换为你在服务器上的非 root 专属运行用户
+User=ubuntu
+# 替换为你最终在 Linux 服务器上的部署目录
+WorkingDirectory=/opt/matrix-quant
+ExecStart=/opt/matrix-quant/QuantitativeTrading
+
+# ==========================================
+# 终极守护：崩溃自动拉起
+# ==========================================
+# 只要进程死亡（哪怕是收到 KILL 信号），系统将在 3 秒内无条件拉起重启
+Restart=always
+RestartSec=3
+
+# ==========================================
+# 环境变量隔离配置
+# ==========================================
+Environment="BINANCE_API_KEY=your_binance_api_key"
+Environment="BINANCE_API_SECRET=your_binance_api_secret"
+Environment="TELOXIDE_TOKEN=your_telegram_bot_token"
+Environment="RUST_LOG=info"
+
+# ==========================================
+# HFT 极限性能调优
+# ==========================================
+# 提升网络最大文件句柄数（防 WebSocket 连接风暴耗尽句柄）
+LimitNOFILE=65535
+# 提升 CPU 调度优先级（数值越小优先级越高，-10 为极高优先级）
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target
