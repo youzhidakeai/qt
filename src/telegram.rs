@@ -34,6 +34,10 @@ enum Command {
     Price(String),
     #[command(description = "生成昨日盈亏与交易手续费总结")]
     Yesterday,
+    #[command(description = "订阅新币种并重启引擎。用法: /sub DOGEUSDT")]
+    Sub(String),
+    #[command(description = "取消订阅币种并重启引擎。用法: /unsub DOGEUSDT")]
+    Unsub(String),
 }
 
 pub async fn run_telegram_bot(
@@ -100,12 +104,13 @@ async fn answer(
             bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
         Command::Yesterday => {
+            let _ = bot.send_message(msg.chat.id, "⏳ 正在生成昨日盈亏快照数据，请稍候...").await;
+            
             use time::{OffsetDateTime, UtcOffset, Duration, Time};
             let offset = UtcOffset::from_hms(8, 0, 0).unwrap();
-            let now = OffsetDateTime::now_utc().to_offset(offset);
-            let today_midnight = now.replace_time(Time::MIDNIGHT);
-            let start_of_yesterday = today_midnight - Duration::days(1);
-            let end_of_yesterday = today_midnight - Duration::nanoseconds(1);
+            let now_midnight = OffsetDateTime::now_utc().to_offset(offset).replace_time(Time::MIDNIGHT);
+            let start_of_yesterday = now_midnight - Duration::days(1);
+            let end_of_yesterday = now_midnight - Duration::nanoseconds(1);
             
             let start_ts = start_of_yesterday.unix_timestamp() * 1000;
             let end_ts = end_of_yesterday.unix_timestamp() * 1000;
@@ -113,13 +118,13 @@ async fn answer(
             if let Ok(res) = exec_client.get_income_history(start_ts as u64, end_ts as u64).await {
                 if let Ok(records) = serde_json::from_str::<serde_json::Value>(&res) {
                     if let Some(arr) = records.as_array() {
-                        let mut total_pnl = Decimal::ZERO;
-                        let mut total_fee = Decimal::ZERO;
-                        let mut total_funding = Decimal::ZERO;
+                        let mut total_pnl = rust_decimal::Decimal::ZERO;
+                        let mut total_fee = rust_decimal::Decimal::ZERO;
+                        let mut total_funding = rust_decimal::Decimal::ZERO;
                         
                         for item in arr {
                             if let (Some(income_type), Some(income)) = (item.get("incomeType").and_then(|v| v.as_str()), item.get("income").and_then(|v| v.as_str())) {
-                                if let Ok(val) = Decimal::from_str(income) {
+                                if let Ok(val) = rust_decimal::Decimal::from_str(income) {
                                     match income_type {
                                         "REALIZED_PNL" => total_pnl += val,
                                         "COMMISSION" => total_fee += val,
@@ -387,6 +392,38 @@ async fn answer(
                     }
                 }
                 Err(e) => { bot.send_message(msg.chat.id, format!("⚠️ API 获取持仓失败：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
+            }
+        }
+        Command::Sub(args) => {
+            let symbol = args.trim().to_uppercase();
+            if symbol.is_empty() {
+                let _ = bot.send_message(msg.chat.id, "❌ 错误: 参数为空。\n用法: /sub &lt;币种&gt;\n示例: /sub DOGEUSDT").parse_mode(teloxide::types::ParseMode::Html).await;
+                return Ok(());
+            }
+            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            if let Ok(client) = redis::Client::open(redis_url) {
+                if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+                    let _: () = redis::cmd("SADD").arg("SUBSCRIBED_SYMBOLS").arg(&symbol).query_async(&mut con).await.unwrap_or_default();
+                    let _ = bot.send_message(msg.chat.id, format!("✅ 已将 <b>{}</b> 添加到监控列表！\n\n🔄 正在触发引擎热重启以加载全新的数据流通道和量化模型，请稍候...", symbol)).parse_mode(teloxide::types::ParseMode::Html).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    std::process::exit(0);
+                }
+            }
+        }
+        Command::Unsub(args) => {
+            let symbol = args.trim().to_uppercase();
+            if symbol.is_empty() {
+                let _ = bot.send_message(msg.chat.id, "❌ 错误: 参数为空。\n用法: /unsub &lt;币种&gt;\n示例: /unsub DOGEUSDT").parse_mode(teloxide::types::ParseMode::Html).await;
+                return Ok(());
+            }
+            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            if let Ok(client) = redis::Client::open(redis_url) {
+                if let Ok(mut con) = client.get_multiplexed_async_connection().await {
+                    let _: () = redis::cmd("SREM").arg("SUBSCRIBED_SYMBOLS").arg(&symbol).query_async(&mut con).await.unwrap_or_default();
+                    let _ = bot.send_message(msg.chat.id, format!("✅ 已将 <b>{}</b> 从监控列表移除！\n\n🔄 正在触发引擎热重启释放连接池资源，请稍候...", symbol)).parse_mode(teloxide::types::ParseMode::Html).await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    std::process::exit(0);
+                }
             }
         }
     }

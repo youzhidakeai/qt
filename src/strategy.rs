@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, error};
+use rust_decimal::prelude::FromPrimitive;
 
 use crate::execution::BinanceExecutionClient;
 use crate::orderbook::OrderBookManager;
@@ -19,6 +20,10 @@ pub enum ControlMessage {
     ClearPosition,
     ClosePosition,
     SyncPosition,
+    ForceUpdatePosition {
+        amt: Decimal,
+        entry: Decimal,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -88,6 +93,7 @@ pub struct StrategyEngine {
     pub last_signal_time: Option<std::time::Instant>,
     pub current_funding_rate: Decimal,
     pub last_funding_fetch: Option<std::time::Instant>,
+    pub last_tick_time: Option<std::time::Instant>,
 }
 
 impl StrategyEngine {
@@ -131,6 +137,7 @@ impl StrategyEngine {
             last_signal_time: None,
             current_funding_rate: Decimal::ZERO,
             last_funding_fetch: None,
+            last_tick_time: None,
         }
     }
 
@@ -239,6 +246,26 @@ impl StrategyEngine {
                     let _ = self.tg_tx.send(format!("❌ [{}] 同步仓位失败: 未在币安账户找到该交易对数据", self.position.symbol)).await;
                 }
             }
+            ControlMessage::ForceUpdatePosition { amt, entry } => {
+                if amt != self.position.position_amt {
+                    if amt == Decimal::ZERO {
+                        self.position.position_amt = Decimal::ZERO;
+                        info!("🔄 [{}] 发现仓位归零 (可能被强平/手动平仓)，已自愈更新。", self.position.symbol);
+                    } else {
+                        self.position.position_amt = amt;
+                        self.position.entry_price = entry;
+                        // Reset highest/lowest to current price to restart trailing SL safely
+                        let current_price = {
+                            let ob = self.ob_manager.book.read().unwrap();
+                            ob.bids.iter().next_back().map(|(p, _)| *p).unwrap_or(entry)
+                        };
+                        self.position.highest_price_since_entry = if self.position.highest_price_since_entry < current_price { current_price } else { self.position.highest_price_since_entry };
+                        self.position.lowest_price_since_entry = if self.position.lowest_price_since_entry > current_price { current_price } else { self.position.lowest_price_since_entry };
+                        info!("🔄 [{}] 发现仓位变化 (部分成交或手工修改)，已自愈更新。量: {}, 均价: {}", self.position.symbol, amt, entry);
+                    }
+                    self.position.save_state(&self.redis_client).await;
+                }
+            }
         }
     }
 
@@ -285,15 +312,21 @@ impl StrategyEngine {
         if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
             let mid_price = (bid + ask) / dec!(2);
             
-            if self.mid_price_history.len() == self.breakout_window {
-                self.mid_price_history.pop_front();
+            // Time-based exponential decay (half-life = 1 second)
+            let dt_secs = self.last_tick_time.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            self.last_tick_time = Some(std::time::Instant::now());
+            if dt_secs > 0.0 {
+                let decay_factor = (-dt_secs / 1.442695).exp(); // e^(-dt / (t_half / ln2))
+                if let Some(decay_dec) = rust_decimal::Decimal::from_f64(decay_factor) {
+                    self.taker_buy_flow *= decay_dec;
+                    self.taker_sell_flow *= decay_dec;
+                }
             }
-            self.mid_price_history.push_back(mid_price);
 
-            self.taker_buy_flow *= dec!(0.90);
-            self.taker_sell_flow *= dec!(0.90);
-
-            if self.mid_price_history.len() < self.breakout_window { return; }
+            if self.mid_price_history.len() < self.breakout_window {
+                self.mid_price_history.push_back(mid_price);
+                return;
+            }
 
             let mut local_high = dec!(0);
             let mut local_low = dec!(999999999);
@@ -301,6 +334,10 @@ impl StrategyEngine {
                 if p > local_high { local_high = p; }
                 if p < local_low { local_low = p; }
             }
+
+            // 更新历史窗口
+            self.mid_price_history.pop_front();
+            self.mid_price_history.push_back(mid_price);
 
             self.tick_counter += 1;
             if self.tick_counter % 100 == 0 { // 约每10秒打印一次
@@ -377,7 +414,7 @@ impl StrategyEngine {
                         
                         info!("🏁 [{}] 多单离场信号！正在向交易所发送市价卖出（平多）指令...", self.position.symbol);
                         
-                        let qty_str = self.position.position_amt.abs().to_string();
+                        let qty_str = self.position.position_amt.abs().normalize().to_string();
                         match self.exec_client.place_order(&self.position.symbol, "SELL", "MARKET", &qty_str, true).await {
                             Ok(_) => {
                                 info!("✅ [{}] 成功平多！最终净盈亏: {}%", self.position.symbol, net_pnl_pct.round_dp(3));
@@ -405,7 +442,7 @@ impl StrategyEngine {
 
                         info!("🏁 [{}] 空单离场信号！正在向交易所发送市价买入（平空）指令...", self.position.symbol);
                         
-                        let qty_str = self.position.position_amt.abs().to_string();
+                        let qty_str = self.position.position_amt.abs().normalize().to_string();
                         match self.exec_client.place_order(&self.position.symbol, "BUY", "MARKET", &qty_str, true).await {
                             Ok(_) => {
                                 info!("✅ [{}] 成功平空！最终净盈亏: {}%", self.position.symbol, net_pnl_pct.round_dp(3));

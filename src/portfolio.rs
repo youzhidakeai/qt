@@ -20,6 +20,7 @@ pub struct PortfolioManager {
     control_senders: HashMap<String, mpsc::Sender<ControlMessage>>,
     signal_rx: mpsc::Receiver<SignalEvent>,
     tg_tx: mpsc::Sender<String>,
+    exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
 }
 
 impl PortfolioManager {
@@ -28,8 +29,9 @@ impl PortfolioManager {
         control_senders: HashMap<String, mpsc::Sender<ControlMessage>>,
         signal_rx: mpsc::Receiver<SignalEvent>,
         tg_tx: mpsc::Sender<String>,
+        exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
     ) -> Self {
-        Self { exec_client, control_senders, signal_rx, tg_tx }
+        Self { exec_client, control_senders, signal_rx, tg_tx, exchange_info }
     }
 
     pub async fn run(mut self) {
@@ -102,15 +104,19 @@ impl PortfolioManager {
             // 强平 30%
             let reduce_amt = largest_pos_amt.abs() * rust_decimal_macros::dec!(0.30);
             
-            let precision = match largest_pos_sym.as_str() {
-                "BTCUSDT" => 3, "ETHUSDT" => 3, "BNBUSDT" => 2, _ => 0,
-            };
             let mut qty_to_reduce = reduce_amt;
-            qty_to_reduce.rescale(precision);
+            if let Some(info) = self.exchange_info.get(&largest_pos_sym) {
+                let step_size = info.step_size;
+                if step_size > rust_decimal::Decimal::ZERO {
+                    let steps = (qty_to_reduce / step_size).floor();
+                    qty_to_reduce = steps * step_size;
+                }
+            }
 
             if qty_to_reduce > Decimal::ZERO {
                 info!("🔪 [中央大脑] 正在强平 {} 的 30% 仓位 (量: {})，为 {} 腾出子弹！", largest_pos_sym, qty_to_reduce, signal.symbol);
-                if let Ok(fill_price) = self.exec_client.place_order(&largest_pos_sym, &largest_pos_side, "MARKET", &qty_to_reduce.to_string(), true).await {
+                let qty_str = qty_to_reduce.normalize().to_string();
+                if let Ok(fill_price) = self.exec_client.place_order(&largest_pos_sym, &largest_pos_side, "MARKET", &qty_str, true).await {
                     // 通知被强平的引擎
                     if let Some(tx) = self.control_senders.get(&largest_pos_sym) {
                         let trade_qty = if largest_pos_side == "BUY" { qty_to_reduce } else { -qty_to_reduce };
@@ -126,14 +132,18 @@ impl PortfolioManager {
     }
 
     async fn execute_trade(&self, symbol: &str, side: &str, notional: Decimal, est_price: Decimal) {
-        let precision = match symbol {
-            "BTCUSDT" => 3, "ETHUSDT" => 3, "BNBUSDT" => 2, _ => 0,
-        };
         let mut target_qty = notional / est_price;
-        target_qty.rescale(precision);
+        if let Some(info) = self.exchange_info.get(symbol) {
+            let step_size = info.step_size;
+            if step_size > rust_decimal::Decimal::ZERO {
+                let steps = (target_qty / step_size).floor();
+                target_qty = steps * step_size;
+            }
+        }
 
+        let qty_str = target_qty.normalize().to_string();
         let _ = self.exec_client.set_leverage(symbol, 10).await;
-        match self.exec_client.place_order(symbol, side, "MARKET", &target_qty.to_string(), false).await {
+        match self.exec_client.place_order(symbol, side, "MARKET", &qty_str, false).await {
             Ok(fill) => {
                 let actual_entry = if fill > Decimal::ZERO { fill } else { est_price };
                 if let Some(tx) = self.control_senders.get(symbol) {

@@ -7,6 +7,13 @@ use std::str::FromStr;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Debug, Clone)]
+pub struct SymbolInfo {
+    pub symbol: String,
+    pub step_size: Decimal,
+    pub tick_size: Decimal,
+}
+
 pub struct BinanceExecutionClient {
     api_key: String,
     api_secret: String,
@@ -187,6 +194,42 @@ impl BinanceExecutionClient {
         } else {
             let error_text = res.text().await.unwrap_or_default();
             Err(format!("获取K线失败: {}", error_text))
+        }
+    }
+
+    pub async fn fetch_exchange_info(&self) -> Result<std::collections::HashMap<String, SymbolInfo>, String> {
+        let url = format!("{}/fapi/v1/exchangeInfo", self.base_url);
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            let text = res.text().await.map_err(|e| e.to_string())?;
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            let mut map = std::collections::HashMap::new();
+            if let Some(symbols) = v["symbols"].as_array() {
+                for sym in symbols {
+                    if let Some(s) = sym["symbol"].as_str() {
+                        let mut step_size = Decimal::ONE;
+                        let mut tick_size = Decimal::ONE;
+                        if let Some(filters) = sym["filters"].as_array() {
+                            for f in filters {
+                                if f["filterType"] == "LOT_SIZE" {
+                                    if let Some(ss) = f["stepSize"].as_str() {
+                                        step_size = Decimal::from_str(ss).unwrap_or(Decimal::ONE);
+                                    }
+                                }
+                                if f["filterType"] == "PRICE_FILTER" {
+                                    if let Some(ts) = f["tickSize"].as_str() {
+                                        tick_size = Decimal::from_str(ts).unwrap_or(Decimal::ONE);
+                                    }
+                                }
+                            }
+                        }
+                        map.insert(s.to_string(), SymbolInfo { symbol: s.to_string(), step_size, tick_size });
+                    }
+                }
+            }
+            Ok(map)
+        } else {
+            Err("Failed to fetch exchange info".to_string())
         }
     }
 }

@@ -10,7 +10,7 @@ mod ml_engine;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, error};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
@@ -73,14 +73,24 @@ async fn main() {
         }
     });
     // ==========================================
-    // MODULE: 动态拉取币安测试网交易热度榜单
+    // MODULE: 动态加载与管理订阅币种
     // ==========================================
-    let top_n: usize = std::env::var("TOP_SYMBOLS_COUNT").unwrap_or_else(|_| "5".to_string()).parse().unwrap_or(5);
-    info!("正在请求币安测试网，获取测试网排名前 {} 的热门币种...", top_n);
-    let top_symbols = fetch_top_symbols(top_n).await;
-    info!("🔥 锁定当前热度榜单: {:?}", top_symbols);
+    let mut redis_con = redis_client.get_multiplexed_async_connection().await.expect("无法连接 Redis");
+    let mut symbols: Vec<String> = redis::cmd("SMEMBERS").arg("SUBSCRIBED_SYMBOLS").query_async(&mut redis_con).await.unwrap_or_default();
     
-    let symbols = top_symbols;
+    if symbols.is_empty() {
+        let top_n: usize = std::env::var("TOP_SYMBOLS_COUNT").unwrap_or_else(|_| "5".to_string()).parse().unwrap_or(5);
+        info!("Redis 订阅列表为空，正在拉取测试网排名前 {} 的热门币种作为初始订阅...", top_n);
+        symbols = fetch_top_symbols(top_n).await;
+        
+        let mut pipe = redis::pipe();
+        for sym in &symbols {
+            pipe.cmd("SADD").arg("SUBSCRIBED_SYMBOLS").arg(sym);
+        }
+        let _: () = pipe.query_async(&mut redis_con).await.unwrap_or_default();
+    }
+    
+    info!("🔥 锁定当前监控名单 (共 {} 个): {:?}", symbols.len(), symbols);
     let mut tg_contexts = HashMap::new();
     let mut control_senders = HashMap::new();
 
@@ -149,11 +159,45 @@ async fn main() {
         telegram::run_telegram_bot(exec_client_bot, tg_ctx_bot).await;
     });
 
+    info!("正在拉取全网交易规范 (Exchange Info)...");
+    let exchange_info = match exec_client.fetch_exchange_info().await {
+        Ok(info) => Arc::new(info),
+        Err(e) => {
+            error!("拉取 Exchange Info 失败: {}，将使用默认极小精度进行交易。", e);
+            Arc::new(HashMap::new())
+        }
+    };
+
     let portfolio_exec = exec_client.clone();
     let portfolio_tg = tg_tx.clone();
+    let portfolio_exchange = exchange_info.clone();
+    let control_senders_clone = control_senders.clone();
     tokio::spawn(async move {
-        let pm = portfolio::PortfolioManager::new(portfolio_exec, control_senders, signal_rx, portfolio_tg);
+        let pm = portfolio::PortfolioManager::new(portfolio_exec, control_senders_clone, signal_rx, portfolio_tg, portfolio_exchange);
         pm.run().await;
+    });
+
+    // ==========================================
+    // MODULE: 10秒仓位“自愈”定时轮询 (Self-Healing Poller)
+    // ==========================================
+    let sync_exec = exec_client.clone();
+    let sync_control = control_senders.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            if let Ok(pos_str) = sync_exec.check_positions().await {
+                if let Ok(positions) = serde_json::from_str::<Vec<serde_json::Value>>(&pos_str) {
+                    for pos in positions {
+                        let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+                        let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if let Some(tx) = sync_control.get(&sym) {
+                            let entry = pos.get("entryPrice").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+                            let _ = tx.send(crate::strategy::ControlMessage::ForceUpdatePosition { amt, entry }).await;
+                        }
+                    }
+                }
+            }
+        }
     });
 
     // ==========================================
