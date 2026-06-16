@@ -354,7 +354,7 @@ async fn answer(
                                 let can_trade = json.get("canTrade").and_then(|v| v.as_bool()).unwrap_or(true); // default to true if missing
                                 let status_icon = if can_trade { "✅" } else { "❌(被禁用)" };
                                 
-                                format!("📊 <b>实盘资产报告 (测试网)</b>\n\n💰 <b>钱包总余额</b>: {} USDT\n💵 <b>可用开仓金</b>: {} USDT\n📈 <b>未实现盈亏</b>: {} USDT\n🔓 <b>API 交易权限</b>: {}", 
+                                format!("📊 <b>实盘资产报告</b>\n\n💰 <b>钱包总余额</b>: {} USDT\n💵 <b>可用开仓金</b>: {} USDT\n📈 <b>未实现盈亏</b>: {} USDT\n🔓 <b>API 交易权限</b>: {}", 
                                     balance, avail, unpnl, status_icon)
                             }
                         }
