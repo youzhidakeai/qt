@@ -20,8 +20,10 @@ enum Command {
     Buy(String),
     #[command(description = "狙击做空。用法: /sell &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆&gt;")]
     Sell(String),
-    #[command(description = "紧急清仓某个币种。用法: /panic DOGEUSDT")]
+    #[command(description = "紧急清仓某个币种 (仅清空记忆不平仓)。用法: /panic DOGEUSDT")]
     Panic(String),
+    #[command(description = "一键市价全平 (真实平仓并清空记忆)。用法: /close <交易对>")]
+    Close(String),
     #[command(description = "检查交易所连接")]
     Status,
     #[command(description = "查看当前所有持仓与未实现收益")]
@@ -242,7 +244,16 @@ async fn answer(
             let symbol = args.trim().to_uppercase();
             if let Some(ctx) = contexts.get(&symbol) {
                 let _ = ctx.control_tx.send(ControlMessage::ClearPosition).await;
-                bot.send_message(msg.chat.id, format!("✅ {} 大脑仓位已被清零，终止移动止损保护。", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                bot.send_message(msg.chat.id, format!("✅ {} 大脑仓位已被清零，终止移动止损保护 (注意: 这不会在币安平仓，只会清空记忆)。", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+            } else {
+                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+            }
+        }
+        Command::Close(args) => {
+            let symbol = args.trim().to_uppercase();
+            if let Some(ctx) = contexts.get(&symbol) {
+                let _ = ctx.control_tx.send(ControlMessage::ClosePosition).await;
+                bot.send_message(msg.chat.id, format!("⌛️ 正在向交易所发送 {} 的一键市价全平指令...", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             } else {
                 bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             }

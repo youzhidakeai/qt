@@ -17,6 +17,7 @@ pub enum ControlMessage {
         fill_price: Decimal,
     },
     ClearPosition,
+    ClosePosition,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -44,8 +45,11 @@ impl PositionManager {
         let key = format!("{}_state", symbol);
         if let Ok(mut con) = redis.get_multiplexed_async_connection().await {
             if let Ok(content) = redis::cmd("GET").arg(&key).query_async::<String>(&mut con).await {
-                if let Ok(state) = serde_json::from_str::<Self>(&content) {
-                    return Some(state);
+                match serde_json::from_str::<Self>(&content) {
+                    Ok(state) => return Some(state),
+                    Err(e) => {
+                        error!("❌ [严重错误] 反序列化 Redis 状态失败！符号: {} | 错误: {} | 原始数据: {}", symbol, e, content);
+                    }
                 }
             }
         }
@@ -165,6 +169,26 @@ impl StrategyEngine {
             ControlMessage::ClearPosition => {
                 self.position.position_amt = Decimal::ZERO;
                 self.position.save_state(&self.redis_client).await;
+            }
+            ControlMessage::ClosePosition => {
+                let current_qty = self.position.position_amt;
+                if current_qty == Decimal::ZERO {
+                    let _ = self.tg_tx.send(format!("⚠️ [{}] 当前大脑记忆中没有仓位，无需平仓。如果币安 APP 上有遗留仓位，请手动在 APP 上平掉。", self.position.symbol)).await;
+                    return;
+                }
+                let side = if current_qty > Decimal::ZERO { "SELL" } else { "BUY" };
+                let qty_str = current_qty.abs().to_string();
+                let res = self.exec_client.place_order(&self.position.symbol, side, "MARKET", &qty_str, true).await;
+                match res {
+                    Ok(_) => {
+                        self.position.position_amt = Decimal::ZERO;
+                        self.position.save_state(&self.redis_client).await;
+                        let _ = self.tg_tx.send(format!("✅ [{}] 一键手动平仓成功！仓位已清零。", self.position.symbol)).await;
+                    }
+                    Err(e) => {
+                        let _ = self.tg_tx.send(format!("❌ [{}] 一键手动平仓失败: {}", self.position.symbol, e)).await;
+                    }
+                }
             }
         }
     }
