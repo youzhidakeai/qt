@@ -419,7 +419,7 @@ impl StrategyEngine {
                             Ok(_) => {
                                 info!("✅ [{}] 成功平多！最终净盈亏: {}%", self.position.symbol, net_pnl_pct.round_dp(3));
                                 let emoji = if net_pnl_pct > Decimal::ZERO { "🏆" } else { "🔪" };
-                                let _ = self.tg_tx.send(format!("{} 移动止损平多战报\n\n交易对: {}\n离场均价: {}\n扣除手续费净盈亏: {}%", emoji, self.position.symbol, bid, net_pnl_pct.round_dp(3))).await;
+                                let _ = self.tg_tx.send(format!("{} 移动止损平多战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}%\n💸 手续费: -{}%\n💰 净盈亏: {}%", emoji, self.position.symbol, bid, gross_pnl_pct.round_dp(3), self.round_trip_fee_pct.round_dp(3), net_pnl_pct.round_dp(3))).await;
                                 self.position.position_amt = Decimal::ZERO;
                                 state_changed = true;
                             }
@@ -447,7 +447,7 @@ impl StrategyEngine {
                             Ok(_) => {
                                 info!("✅ [{}] 成功平空！最终净盈亏: {}%", self.position.symbol, net_pnl_pct.round_dp(3));
                                 let emoji = if net_pnl_pct > Decimal::ZERO { "🏆" } else { "🔪" };
-                                let _ = self.tg_tx.send(format!("{} 移动止损平空战报\n\n交易对: {}\n离场均价: {}\n扣除手续费净盈亏: {}%", emoji, self.position.symbol, ask, net_pnl_pct.round_dp(3))).await;
+                                let _ = self.tg_tx.send(format!("{} 移动止损平空战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}%\n💸 手续费: -{}%\n💰 净盈亏: {}%", emoji, self.position.symbol, ask, gross_pnl_pct.round_dp(3), self.round_trip_fee_pct.round_dp(3), net_pnl_pct.round_dp(3))).await;
                                 self.position.position_amt = Decimal::ZERO;
                                 state_changed = true;
                             }
