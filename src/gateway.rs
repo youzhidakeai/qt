@@ -15,7 +15,8 @@ pub async fn run_binance_ws(symbol: &str, tx: mpsc::Sender<DepthUpdate>) {
         match connect_async(&ws_url).await {
             Ok((mut ws_stream, _)) => {
                 retry_delay = 1;
-                while let Some(msg) = ws_stream.next().await {
+                // 【修复：添加 10 秒超时】如果 10 秒内没有任何数据包（包括 Ping），说明底层的 TCP 已经被静默切断，必须断开重连
+                while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(10), ws_stream.next()).await {
                     match msg {
                         Ok(Message::Text(text)) => {
                             match serde_json::from_str::<DepthUpdate>(&text) {
@@ -53,7 +54,7 @@ pub async fn run_aggtrade_ws(symbol: &str, tx: mpsc::Sender<AggTradeUpdate>) {
             Ok((mut ws_stream, _)) => {
                 info!("✅ [{}] Trade 流接入成功，主动吃单嗅探器启动！", symbol);
                 retry_delay = 1;
-                while let Some(msg) = ws_stream.next().await {
+                while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(10), ws_stream.next()).await {
                     match msg {
                         Ok(Message::Text(text)) => {
                             match serde_json::from_str::<AggTradeUpdate>(&text) {

@@ -163,6 +163,9 @@ async fn main() {
     let tg_tx_ticker = tg_tx.clone();
     let redis_ticker = redis_client.clone();
     tokio::spawn(async move {
+        // 【关键修复】先让系统等 15 秒，等 WebSocket 深度完全建立起来再扫瞄，防止第一根 K 线拿到 0
+        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
         let mut last_prices: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
         loop {

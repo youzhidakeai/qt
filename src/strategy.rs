@@ -19,7 +19,8 @@ pub enum ControlMessage {
     ClearPosition,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct PositionManager {
     pub symbol: String,
     pub is_isolated: bool,
@@ -113,7 +114,7 @@ impl StrategyEngine {
             redis_client,
             mid_price_history: VecDeque::with_capacity(300),
             breakout_window: 300,
-            trailing_sl_pct: dec!(1.5),
+            trailing_sl_pct: dec!(0.8), // 【优化】将回撤容忍度从 1.5% 缩小到 0.8%，在 10倍杠杆下这能锁定绝大部分利润
             round_trip_fee_pct: dec!(0.1),
             taker_buy_flow: Decimal::ZERO,
             taker_sell_flow: Decimal::ZERO,
@@ -312,7 +313,10 @@ impl StrategyEngine {
                                 self.position.position_amt = Decimal::ZERO;
                                 state_changed = true;
                             }
-                            Err(e) => error!("❌ [{}] API平仓失败: {}", self.position.symbol, e),
+                            Err(e) => {
+                                error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
+                                let _ = self.tg_tx.send(format!("⚠️ <b>紧急警报：平多单 API 被拒！</b>\n交易对: {}\n请立即打开币安 APP 手动平仓！\n原因: {}", self.position.symbol, e)).await;
+                            }
                         }
                     }
                 } else if self.position.position_amt < Decimal::ZERO { 
@@ -337,7 +341,10 @@ impl StrategyEngine {
                                 self.position.position_amt = Decimal::ZERO;
                                 state_changed = true;
                             }
-                            Err(e) => error!("❌ [{}] API平仓失败: {}", self.position.symbol, e),
+                            Err(e) => {
+                                error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
+                                let _ = self.tg_tx.send(format!("⚠️ <b>紧急警报：平空单 API 被拒！</b>\n交易对: {}\n请立即打开币安 APP 手动平仓！\n原因: {}", self.position.symbol, e)).await;
+                            }
                         }
                     }
                 }
