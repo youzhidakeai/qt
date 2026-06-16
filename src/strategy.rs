@@ -411,6 +411,9 @@ impl StrategyEngine {
                     if bid <= dynamic_sl_price {
                         let gross_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100);
                         let net_pnl_pct = gross_pnl_pct - self.round_trip_fee_pct;
+                        let gross_pnl_usdt = (bid - self.position.entry_price) * self.position.position_amt;
+                        let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * bid) * dec!(0.0005);
+                        let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
                         
                         info!("🏁 [{}] 多单离场信号！正在向交易所发送市价卖出（平多）指令...", self.position.symbol);
                         
@@ -419,7 +422,7 @@ impl StrategyEngine {
                             Ok(_) => {
                                 info!("✅ [{}] 成功平多！最终净盈亏: {}%", self.position.symbol, net_pnl_pct.round_dp(3));
                                 let emoji = if net_pnl_pct > Decimal::ZERO { "🏆" } else { "🔪" };
-                                let _ = self.tg_tx.send(format!("{} 移动止损平多战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}%\n💸 手续费: -{}%\n💰 净盈亏: {}%", emoji, self.position.symbol, bid, gross_pnl_pct.round_dp(3), self.round_trip_fee_pct.round_dp(3), net_pnl_pct.round_dp(3))).await;
+                                let _ = self.tg_tx.send(format!("{} 移动止损平多战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}% ({} U)\n💸 手续费: -{}% ({} U)\n💰 净盈亏: {}% ({} U)", emoji, self.position.symbol, bid, gross_pnl_pct.round_dp(3), gross_pnl_usdt.round_dp(3), self.round_trip_fee_pct.round_dp(3), fee_usdt.round_dp(3), net_pnl_pct.round_dp(3), net_pnl_usdt.round_dp(3))).await;
                                 self.position.position_amt = Decimal::ZERO;
                                 state_changed = true;
                             }
@@ -440,6 +443,10 @@ impl StrategyEngine {
                         let gross_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100);
                         let net_pnl_pct = gross_pnl_pct - self.round_trip_fee_pct;
 
+                        let gross_pnl_usdt = (self.position.entry_price - ask) * self.position.position_amt.abs();
+                        let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * ask) * dec!(0.0005);
+                        let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
+                        
                         info!("🏁 [{}] 空单离场信号！正在向交易所发送市价买入（平空）指令...", self.position.symbol);
                         
                         let qty_str = self.position.position_amt.abs().normalize().to_string();
@@ -447,7 +454,7 @@ impl StrategyEngine {
                             Ok(_) => {
                                 info!("✅ [{}] 成功平空！最终净盈亏: {}%", self.position.symbol, net_pnl_pct.round_dp(3));
                                 let emoji = if net_pnl_pct > Decimal::ZERO { "🏆" } else { "🔪" };
-                                let _ = self.tg_tx.send(format!("{} 移动止损平空战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}%\n💸 手续费: -{}%\n💰 净盈亏: {}%", emoji, self.position.symbol, ask, gross_pnl_pct.round_dp(3), self.round_trip_fee_pct.round_dp(3), net_pnl_pct.round_dp(3))).await;
+                                let _ = self.tg_tx.send(format!("{} 移动止损平空战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}% ({} U)\n💸 手续费: -{}% ({} U)\n💰 净盈亏: {}% ({} U)", emoji, self.position.symbol, ask, gross_pnl_pct.round_dp(3), gross_pnl_usdt.round_dp(3), self.round_trip_fee_pct.round_dp(3), fee_usdt.round_dp(3), net_pnl_pct.round_dp(3), net_pnl_usdt.round_dp(3))).await;
                                 self.position.position_amt = Decimal::ZERO;
                                 state_changed = true;
                             }
