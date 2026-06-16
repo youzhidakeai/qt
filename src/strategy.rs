@@ -76,8 +76,10 @@ pub struct StrategyEngine {
     pub trailing_sl_pct: Decimal,
     pub round_trip_fee_pct: Decimal,
 
-    pub taker_buy_flow: Decimal,
-    pub taker_sell_flow: Decimal,
+    pub fast_buy_flow: Decimal,
+    pub fast_sell_flow: Decimal,
+    pub slow_buy_flow: Decimal,
+    pub slow_sell_flow: Decimal,
 
     // 全自动实盘扣款参数 (测试网可以随便填)
     #[allow(dead_code)]
@@ -131,8 +133,10 @@ impl StrategyEngine {
             activation_pct: dec!(3.0),
             trailing_sl_pct: dec!(1.5),
             round_trip_fee_pct: dec!(0.1),
-            taker_buy_flow: Decimal::ZERO,
-            taker_sell_flow: Decimal::ZERO,
+            fast_buy_flow: Decimal::ZERO,
+            fast_sell_flow: Decimal::ZERO,
+            slow_buy_flow: Decimal::ZERO,
+            slow_sell_flow: Decimal::ZERO,
             auto_margin_usdt: dec!(50.0),
             auto_leverage: 10,
             tg_tx,
@@ -277,9 +281,11 @@ impl StrategyEngine {
         use std::str::FromStr;
         let qty = rust_decimal::Decimal::from_str(&trade.qty).unwrap_or_default();
         if trade.is_buyer_maker {
-            self.taker_sell_flow += qty;
+            self.fast_sell_flow += qty;
+            self.slow_sell_flow += qty;
         } else {
-            self.taker_buy_flow += qty;
+            self.fast_buy_flow += qty;
+            self.slow_buy_flow += qty;
         }
     }
 
@@ -316,16 +322,20 @@ impl StrategyEngine {
         if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
             let mid_price = (bid + ask) / dec!(2);
             
-            // Time-based exponential decay (half-life = 1 second)
-            let dt_secs = self.last_tick_time.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-            self.last_tick_time = Some(std::time::Instant::now());
-            if dt_secs > 0.0 {
-                let decay_factor = (-dt_secs / 1.442695).exp(); // e^(-dt / (t_half / ln2))
-                if let Some(decay_dec) = rust_decimal::Decimal::from_f64(decay_factor) {
-                    self.taker_buy_flow *= decay_dec;
-                    self.taker_sell_flow *= decay_dec;
+            // Time-based exponential decay (half-life = 1s and 30s)
+            let now = std::time::Instant::now();
+            if let Some(last_time) = self.last_tick_time {
+                let dt = now.duration_since(last_time).as_secs_f64();
+                if dt > 0.0 {
+                    let fast_decay = Decimal::from_f64((0.5_f64).powf(dt / 1.0)).unwrap();
+                    let slow_decay = Decimal::from_f64((0.5_f64).powf(dt / 30.0)).unwrap();
+                    self.fast_buy_flow *= fast_decay;
+                    self.fast_sell_flow *= fast_decay;
+                    self.slow_buy_flow *= slow_decay;
+                    self.slow_sell_flow *= slow_decay;
                 }
             }
+            self.last_tick_time = Some(now);
 
             if self.mid_price_history.len() < self.breakout_window {
                 self.mid_price_history.push_back(mid_price);
@@ -345,8 +355,8 @@ impl StrategyEngine {
 
             self.tick_counter += 1;
             if self.tick_counter % 100 == 0 { // 约每10秒打印一次
-                info!("🔍 [切片追踪 {}] 最新价: {} | 订单簿失衡指数(OBI): {:.3} | 买方动能流: {:.2} | 卖方动能流: {:.2} | 30s局部高/低点: {} / {}",
-                      self.position.symbol, bid, obi, self.taker_buy_flow, self.taker_sell_flow, local_high, local_low);
+                info!("🔍 [切片追踪 {}] 最新价: {} | 订单簿失衡指数(OBI): {:.3} | 快买/卖流: {:.2}/{:.2} | 慢买/卖流: {:.2}/{:.2} | 30s局部高/低点: {} / {}",
+                      self.position.symbol, bid, obi, self.fast_buy_flow, self.fast_sell_flow, self.slow_buy_flow, self.slow_sell_flow, local_high, local_low);
             }
 
             let mut state_changed = false;
@@ -369,10 +379,12 @@ impl StrategyEngine {
                 }
 
                 if bid > local_high {
-                    let is_strong = obi > dec!(0.3) && self.taker_buy_flow > self.taker_sell_flow * dec!(3.0);
-                    let strength = if is_strong { "S" } else { "A" };
+                    let is_strong_fast = obi > dec!(0.3) && self.fast_buy_flow > self.fast_sell_flow * dec!(3.0);
+                    let is_strong_slow = self.slow_buy_flow > self.slow_sell_flow * dec!(1.5);
+                    let is_strong = is_strong_fast && is_strong_slow;
                     
-                    let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.taker_buy_flow, self.taker_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
+                    let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
+                    let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
                     if ml_prob > dec!(0.6) {
                         info!("🚀 [{}] 触发做多信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
                         
@@ -385,10 +397,12 @@ impl StrategyEngine {
                         self.last_signal_time = Some(std::time::Instant::now());
                     }
                 } else if ask < local_low {
-                    let is_strong = obi < dec!(-0.3) && self.taker_sell_flow > self.taker_buy_flow * dec!(3.0);
-                    let strength = if is_strong { "S" } else { "A" };
+                    let is_strong_fast = obi < dec!(-0.3) && self.fast_sell_flow > self.fast_buy_flow * dec!(3.0);
+                    let is_strong_slow = self.slow_sell_flow > self.slow_buy_flow * dec!(1.5);
+                    let is_strong = is_strong_fast && is_strong_slow;
                     
-                    let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.taker_buy_flow, self.taker_sell_flow, self.current_funding_rate, "SELL", &self.mid_price_history);
+                    let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
+                    let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "SELL", &self.mid_price_history);
                     if ml_prob > dec!(0.6) {
                         info!("💥 [{}] 触发做空信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
 
@@ -411,11 +425,20 @@ impl StrategyEngine {
                         state_changed = true;
                     }
                     let current_profit_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100);
-                    let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
+                    let mut dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.highest_price_since_entry * (dec!(1) - self.trailing_sl_pct / dec!(100))
                     } else {
                         self.position.entry_price * (dec!(1) - self.initial_sl_pct / dec!(100))
                     };
+
+                    if current_profit_pct < self.activation_pct {
+                        if let Some(thick_bid) = self.ob_manager.get_thickest_wall(true, 10) {
+                            let wall_sl = thick_bid * dec!(0.9995); 
+                            if wall_sl > dynamic_sl_price && wall_sl < self.position.entry_price {
+                                dynamic_sl_price = wall_sl;
+                            }
+                        }
+                    }
 
                     if bid <= dynamic_sl_price {
                         let gross_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100);
@@ -448,11 +471,20 @@ impl StrategyEngine {
                         state_changed = true;
                     }
                     let current_profit_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100);
-                    let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
+                    let mut dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.lowest_price_since_entry * (dec!(1) + self.trailing_sl_pct / dec!(100))
                     } else {
                         self.position.entry_price * (dec!(1) + self.initial_sl_pct / dec!(100))
                     };
+
+                    if current_profit_pct < self.activation_pct {
+                        if let Some(thick_ask) = self.ob_manager.get_thickest_wall(false, 10) {
+                            let wall_sl = thick_ask * dec!(1.0005);
+                            if wall_sl < dynamic_sl_price && wall_sl > self.position.entry_price {
+                                dynamic_sl_price = wall_sl;
+                            }
+                        }
+                    }
 
                     if ask >= dynamic_sl_price {
                         let gross_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100);

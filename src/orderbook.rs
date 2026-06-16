@@ -49,6 +49,29 @@ impl OrderBookManager {
         }
     }
 
+    pub fn get_thickest_wall(&self, is_bid: bool, levels: usize) -> Option<Decimal> {
+        let book = self.book.read().expect("RwLock poisoned");
+        let mut best_price = None;
+        let mut max_qty = Decimal::ZERO;
+        
+        if is_bid {
+            for (price, qty) in book.bids.iter().rev().take(levels) {
+                if *qty > max_qty {
+                    max_qty = *qty;
+                    best_price = Some(*price);
+                }
+            }
+        } else {
+            for (price, qty) in book.asks.iter().take(levels) {
+                if *qty > max_qty {
+                    max_qty = *qty;
+                    best_price = Some(*price);
+                }
+            }
+        }
+        best_price
+    }
+
     pub fn print_top_of_book(&self) {
         let book = self.book.read().expect("RwLock poisoned");
         
