@@ -18,6 +18,7 @@ pub enum ControlMessage {
     },
     ClearPosition,
     ClosePosition,
+    SyncPosition,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -188,6 +189,54 @@ impl StrategyEngine {
                     Err(e) => {
                         let _ = self.tg_tx.send(format!("❌ [{}] 一键手动平仓失败: {}", self.position.symbol, e)).await;
                     }
+                }
+            }
+            ControlMessage::SyncPosition => {
+                let pos_str = match self.exec_client.check_positions().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = self.tg_tx.send(format!("❌ [{}] 同步仓位失败: 无法连接币安API ({})", self.position.symbol, e)).await;
+                        return;
+                    }
+                };
+                let positions: Vec<serde_json::Value> = serde_json::from_str(&pos_str).unwrap_or_default();
+                let mut found = false;
+                use std::str::FromStr;
+                for pos in positions {
+                    let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                    if sym == self.position.symbol {
+                        let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+                        if amt.abs() > rust_decimal::Decimal::ZERO {
+                            let entry = pos.get("entryPrice").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+                            self.position.position_amt = amt;
+                            self.position.entry_price = entry;
+                            
+                            // 获取最新盘口价作为当前的最高/最低基准
+                            let current_price = {
+                                let ob = self.ob_manager.book.read().unwrap();
+                                if amt > rust_decimal::Decimal::ZERO {
+                                    ob.bids.iter().next_back().map(|(p, _)| *p).unwrap_or(entry)
+                                } else {
+                                    ob.asks.iter().next().map(|(p, _)| *p).unwrap_or(entry)
+                                }
+                            };
+                            
+                            self.position.highest_price_since_entry = if current_price > entry { current_price } else { entry };
+                            self.position.lowest_price_since_entry = if current_price < entry && current_price > rust_decimal::Decimal::ZERO { current_price } else { entry };
+                            
+                            self.position.save_state(&self.redis_client).await;
+                            let _ = self.tg_tx.send(format!("✅ [{}] 手动仓位接管成功！\n持仓量: {}\n开仓均价: {}\n已挂载移动止损保护，当前监测基准价: {}", self.position.symbol, amt, entry, current_price)).await;
+                        } else {
+                            self.position.position_amt = rust_decimal::Decimal::ZERO;
+                            self.position.save_state(&self.redis_client).await;
+                            let _ = self.tg_tx.send(format!("⚠️ [{}] 币安 APP 上当前没有持仓。大脑记忆已同步清零。", self.position.symbol)).await;
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    let _ = self.tg_tx.send(format!("❌ [{}] 同步仓位失败: 未在币安账户找到该交易对数据", self.position.symbol)).await;
                 }
             }
         }

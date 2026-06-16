@@ -24,6 +24,8 @@ enum Command {
     Panic(String),
     #[command(description = "一键市价全平 (真实平仓并清空记忆)。用法: /close <交易对>")]
     Close(String),
+    #[command(description = "从币安同步真实仓位并开启监控。用法: /sync <交易对>")]
+    Sync(String),
     #[command(description = "检查交易所连接")]
     Status,
     #[command(description = "查看当前所有持仓与未实现收益")]
@@ -254,6 +256,15 @@ async fn answer(
             if let Some(ctx) = contexts.get(&symbol) {
                 let _ = ctx.control_tx.send(ControlMessage::ClosePosition).await;
                 bot.send_message(msg.chat.id, format!("⌛️ 正在向交易所发送 {} 的一键市价全平指令...", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+            } else {
+                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+            }
+        }
+        Command::Sync(args) => {
+            let symbol = args.trim().to_uppercase();
+            if let Some(ctx) = contexts.get(&symbol) {
+                let _ = ctx.control_tx.send(ControlMessage::SyncPosition).await;
+                bot.send_message(msg.chat.id, format!("⌛️ 正在从币安同步 {} 的真实仓位数据...", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             } else {
                 bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
             }
