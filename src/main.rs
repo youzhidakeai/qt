@@ -286,7 +286,8 @@ async fn main() {
                                     };
                                     
                                     let dir = if amt > Decimal::ZERO { "🟢 多" } else { "🔴 空" };
-                                    extra_info = format!("\n    ↪ {}仓 | 均价: {} | 盈亏: {:.2}U | 预计平仓(止损)价: {:.4}", dir, entry, unpnl, sl_price);
+                                    let notional = amt.abs() * if amt > Decimal::ZERO { bid_price } else { ask_price };
+                                    extra_info = format!("\n    ↪ {}仓 | 均价: {} | 数量: {} | 价值: {:.2}U | 盈亏: {:.2}U | 预计平仓(止损)价: {:.4}", dir, entry, amt.abs(), notional, unpnl, sl_price);
                                 }
                             }
                         }
