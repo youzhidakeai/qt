@@ -30,8 +30,8 @@ enum Command {
     Status,
     #[command(description = "查看当前所有持仓与未实现收益")]
     Pnl,
-    #[command(description = "获取当前所有订阅币种的实时盘口价")]
-    Price,
+    #[command(description = "获取当前所有订阅币种的实时盘口价和涨跌幅。用法: /price [时间维度]，例如: /price 15m, /price 1h, /price 24h")]
+    Price(String),
     #[command(description = "生成昨日盈亏与交易手续费总结")]
     Yesterday,
 }
@@ -66,25 +66,37 @@ async fn answer(
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string()).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
-        Command::Price => {
-            let mut report = String::from("📈 实时盘口询价反馈\n\n");
-            let mut sym_keys: Vec<String> = contexts.keys().cloned().collect();
-            sym_keys.sort();
+        Command::Price(args) => {
+            let interval = args.trim().to_lowercase();
+            let valid_intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"];
+            let interval_to_use = if valid_intervals.contains(&interval.as_str()) { interval } else { "5m".to_string() };
+
+            bot.send_message(msg.chat.id, format!("⌛️ 正在从币安拉取全网 {} 维度的价格变化，请稍候...", interval_to_use)).await?;
             
-            for sym in sym_keys {
-                if let Some(ctx) = contexts.get(&sym) {
-                    let book = ctx.ob_manager.book.read().unwrap();
-                    let best_bid = book.bids.iter().next_back().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
-                    let best_ask = book.asks.iter().next().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
-                    
-                    if best_bid > Decimal::ZERO && best_ask > Decimal::ZERO {
-                        let mid = (best_bid + best_ask) / dec!(2);
-                        report.push_str(&format!("🔹 <b>{}</b>: {:.5}\n    买一: {} | 卖一: {}\n", sym, mid, best_bid, best_ask));
-                    } else {
-                        report.push_str(&format!("🔹 <b>{}</b>: 深度数据获取中...\n", sym));
+            let mut report = format!("📊 <b>全网 {} 涨跌幅排行榜</b>\n\n", interval_to_use);
+            let mut results = Vec::new();
+
+            for (sym, ctx) in contexts.iter() {
+                let current_price = ctx.ob_manager.book.read().unwrap().bids.iter().next_back().map(|(p, _)| *p).unwrap_or(rust_decimal::Decimal::ZERO);
+                if current_price > rust_decimal::Decimal::ZERO {
+                    if let Ok(past_price) = exec_client.fetch_kline_open_price(sym, &interval_to_use).await {
+                        if past_price > rust_decimal::Decimal::ZERO {
+                            let pct = (current_price - past_price) / past_price * rust_decimal_macros::dec!(100);
+                            results.push((sym.clone(), current_price, pct));
+                        }
                     }
                 }
             }
+
+            // Sort by percentage change descending
+            results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+            for (sym, price, pct) in results {
+                let emoji = if pct > rust_decimal::Decimal::ZERO { "📈" } else { "📉" };
+                let plus = if pct > rust_decimal::Decimal::ZERO { "+" } else { "" };
+                report.push_str(&format!("{} <b>{}</b>: {} ({}{:.2}%)\n", emoji, sym, price, plus, pct));
+            }
+
             bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
         Command::Yesterday => {

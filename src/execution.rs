@@ -163,4 +163,30 @@ impl BinanceExecutionClient {
             Err(format!("获取资金费率失败: {:?}", res.status()))
         }
     }
+
+    pub async fn fetch_kline_open_price(&self, symbol: &str, interval: &str) -> Result<Decimal, String> {
+        let endpoint = "/fapi/v1/klines";
+        let url = format!("{}{}?symbol={}&interval={}&limit=2", self.base_url, endpoint, symbol, interval);
+
+        let res = self.client.get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if res.status().is_success() {
+            let text = res.text().await.map_err(|e| e.to_string())?;
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            if let Some(klines) = v.as_array() {
+                if let Some(first_kline) = klines.first() {
+                    if let Some(open_price_str) = first_kline.get(1).and_then(|v| v.as_str()) {
+                        return Ok(Decimal::from_str(open_price_str).unwrap_or_default());
+                    }
+                }
+            }
+            Err("无法解析 K 线数据".to_string())
+        } else {
+            let error_text = res.text().await.unwrap_or_default();
+            Err(format!("获取K线失败: {}", error_text))
+        }
+    }
 }
