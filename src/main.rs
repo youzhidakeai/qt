@@ -150,15 +150,8 @@ async fn main() {
     }
 
     // ==========================================
-    // MODULE: Telegram 全局中控台
+    // MODULE: 全网交易规范 (Exchange Info)
     // ==========================================
-    let tg_ctx_arc = Arc::new(tg_contexts);
-    let tg_ctx_bot = tg_ctx_arc.clone();
-    let exec_client_bot = exec_client.clone();
-    tokio::spawn(async move {
-        telegram::run_telegram_bot(exec_client_bot, tg_ctx_bot).await;
-    });
-
     info!("正在拉取全网交易规范 (Exchange Info)...");
     let exchange_info = match exec_client.fetch_exchange_info().await {
         Ok(info) => Arc::new(info),
@@ -167,6 +160,17 @@ async fn main() {
             Arc::new(HashMap::new())
         }
     };
+
+    // ==========================================
+    // MODULE: Telegram 全局中控台
+    // ==========================================
+    let tg_ctx_arc = Arc::new(tg_contexts);
+    let tg_ctx_bot = tg_ctx_arc.clone();
+    let exec_client_bot = exec_client.clone();
+    let tg_exchange = exchange_info.clone();
+    tokio::spawn(async move {
+        telegram::run_telegram_bot(exec_client_bot, tg_ctx_bot, tg_exchange).await;
+    });
 
     let portfolio_exec = exec_client.clone();
     let portfolio_tg = tg_tx.clone();

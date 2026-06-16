@@ -154,6 +154,7 @@ impl PortfolioManager {
             }
             Err(e) => {
                 error!("中央大脑执行 {} 失败: {}", symbol, e);
+                let _ = self.tg_tx.send(format!("❌ <b>中央大脑自动下单失败 ({})</b>\n原因: {}", symbol, e)).await;
             }
         }
     }

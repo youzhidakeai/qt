@@ -105,6 +105,40 @@ impl BinanceExecutionClient {
         }
     }
 
+    pub async fn place_limit_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        quantity: &str,
+        price: &str,
+    ) -> Result<String, String> {
+        let endpoint = "/fapi/v1/order";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+
+        let payload = format!(
+            "symbol={}&side={}&type=LIMIT&quantity={}&price={}&timeInForce=GTC&recvWindow=60000&timestamp={}",
+            symbol, side, quantity, price, timestamp
+        );
+
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = res.status();
+        let text = res.text().await.map_err(|e| e.to_string())?;
+
+        if status.is_success() {
+            Ok(text)
+        } else {
+            Err(format!("限价单下单失败: {}", text))
+        }
+    }
+
     pub async fn check_account(&self) -> Result<String, reqwest::Error> {
         let endpoint = "/fapi/v2/account";
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();

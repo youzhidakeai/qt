@@ -16,9 +16,9 @@ use crate::SymbolContext;
 enum Command {
     #[command(description = "显示帮助信息")]
     Help,
-    #[command(description = "狙击做多。用法: /buy &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆&gt; (例: /buy ETHUSDT 500 10)")]
+    #[command(description = "狙击做多。用法: /buy &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆&gt; [限价] (例: /buy ETHUSDT 500 10 1800)")]
     Buy(String),
-    #[command(description = "狙击做空。用法: /sell &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆&gt;")]
+    #[command(description = "狙击做空。用法: /sell &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆&gt; [限价]")]
     Sell(String),
     #[command(description = "紧急清仓某个币种 (仅清空记忆不平仓)。用法: /panic DOGEUSDT")]
     Panic(String),
@@ -43,6 +43,7 @@ enum Command {
 pub async fn run_telegram_bot(
     exec_client: Arc<BinanceExecutionClient>,
     contexts: Arc<HashMap<String, SymbolContext>>,
+    exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
 ) {
     let bot = Bot::from_env();
     info!("🚀 Telegram 遥控机器人已启动，多币种矩阵接入完毕！");
@@ -52,7 +53,7 @@ pub async fn run_telegram_bot(
         .endpoint(answer);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![exec_client, contexts])
+        .dependencies(dptree::deps![exec_client, contexts, exchange_info])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -65,6 +66,7 @@ async fn answer(
     cmd: Command,
     exec_client: Arc<BinanceExecutionClient>,
     contexts: Arc<HashMap<String, SymbolContext>>,
+    exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
 ) -> ResponseResult<()> {
     match cmd {
         Command::Help => {
@@ -156,50 +158,58 @@ async fn answer(
         }
         Command::Buy(args) => {
             let parts: Vec<&str> = args.split_whitespace().collect();
-            if parts.len() != 3 {
-                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /buy &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆倍数&gt;\n例如: /buy ETHUSDT 500 10").parse_mode(teloxide::types::ParseMode::Html).await?;
+            if parts.len() < 3 || parts.len() > 4 {
+                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /buy &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆倍数&gt; [限价]\n例如: /buy ETHUSDT 500 10 1800").parse_mode(teloxide::types::ParseMode::Html).await?;
                 return Ok(());
             }
             let symbol = parts[0].to_uppercase();
             let margin_usdt = Decimal::from_str(parts[1]).unwrap_or_default();
             let leverage = Decimal::from_str(parts[2]).unwrap_or(dec!(1));
+            let limit_price = if parts.len() == 4 { Decimal::from_str(parts[3]).ok() } else { None };
             
             if let Some(ctx) = contexts.get(&symbol) {
-                // 1. 设置真实杠杆倍数
                 let lev_u32 = leverage.to_u32().unwrap_or(1);
                 let _ = exec_client.set_leverage(&symbol, lev_u32).await;
 
-                // 2. 盘口估价与数量计算
-                let estimated_entry = ctx.ob_manager.book.read().unwrap().asks.iter().next().map(|(p, _)| *p).unwrap_or(dec!(1));
+                let estimated_entry = limit_price.unwrap_or_else(|| ctx.ob_manager.book.read().unwrap().asks.iter().next().map(|(p, _)| *p).unwrap_or(dec!(1)));
                 let notional = margin_usdt * leverage;
                 let mut target_qty = notional / estimated_entry;
                 
-                let precision = match symbol.as_str() {
-                    "BTCUSDT" => 3,
-                    "ETHUSDT" => 3,
-                    "BNBUSDT" => 2,
-                    _ => 0,
+                let mut limit_price_str = String::new();
+                if let Some(info) = exchange_info.get(&symbol) {
+                    if info.step_size > Decimal::ZERO {
+                        let steps = (target_qty / info.step_size).floor();
+                        target_qty = steps * info.step_size;
+                    }
+                    if let Some(mut lp) = limit_price {
+                        if info.tick_size > Decimal::ZERO {
+                            let steps = (lp / info.tick_size).floor();
+                            lp = steps * info.tick_size;
+                        }
+                        limit_price_str = lp.normalize().to_string();
+                    }
+                }
+                
+                let qty_str = target_qty.normalize().to_string();
+                
+                let res = if let Some(_) = limit_price {
+                    exec_client.place_limit_order(&symbol, "BUY", &qty_str, &limit_price_str).await.map(|_| Decimal::ZERO)
+                } else {
+                    exec_client.place_order(&symbol, "BUY", "MARKET", &qty_str, false).await.map_err(|e| e.to_string())
                 };
-                target_qty.rescale(precision); 
 
-                bot.send_message(msg.chat.id, format!("⚡️ 准备市价做多 {}...\n本金: {} U | 杠杆: {}x\n计算下单量: {} 个币", 
-                    symbol, margin_usdt, leverage, target_qty)).await?;
-                
-                // 3. 执行真实市价单
-                let qty_str = target_qty.to_string();
-                let res = exec_client.place_order(&symbol, "BUY", "MARKET", &qty_str, false).await;
-                
                 match res {
                     Ok(real_avg_price) => {
-                        // 4. 解析真实的成交均价 (Fill Price)，防滑点
-                        let fill_price = if real_avg_price > Decimal::ZERO { real_avg_price } else { estimated_entry };
-                        
-                        let _ = ctx.control_tx.send(ControlMessage::TradeExecuted {
-                            trade_qty: target_qty, // 买入是正数
-                            fill_price,
-                        }).await;
-                        
-                        bot.send_message(msg.chat.id, format!("✅ {} 做多成功！\n真实成交均价 (Fill Price): {}\n已写入硬盘并挂载移动止损。", symbol, fill_price)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                        if limit_price.is_some() {
+                            bot.send_message(msg.chat.id, format!("✅ <b>[{}] 限价做多 (BUY LIMIT) 下单成功！</b>\n\n🎯 限价: <b>{}</b>\n📦 数量: {}\n\n💡 <i>当订单被币安撮合成交后，引擎的“自愈轮询器”会在 10 秒内自动发现仓位并挂载保护。</i>", symbol, limit_price_str, qty_str)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                        } else {
+                            let fill_price = if real_avg_price > Decimal::ZERO { real_avg_price } else { estimated_entry };
+                            let _ = ctx.control_tx.send(ControlMessage::TradeExecuted {
+                                trade_qty: target_qty,
+                                fill_price,
+                            }).await;
+                            bot.send_message(msg.chat.id, format!("✅ <b>[{}] 市价做多成功！</b>\n\n🎯 真实均价: <b>{}</b>\n📦 下单量: {}\n\n💡 <i>当前仓位已被接管。</i>", symbol, fill_price, qty_str)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                        }
                     }
                     Err(e) => { bot.send_message(msg.chat.id, format!("❌ 订单失败：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
                 }
@@ -209,49 +219,58 @@ async fn answer(
         }
         Command::Sell(args) => {
             let parts: Vec<&str> = args.split_whitespace().collect();
-            if parts.len() != 3 {
-                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /sell &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆倍数&gt;\n例如: /sell ETHUSDT 500 10").parse_mode(teloxide::types::ParseMode::Html).await?;
+            if parts.len() < 3 || parts.len() > 4 {
+                bot.send_message(msg.chat.id, "⚠️ 参数错误。\n用法: /sell &lt;交易对&gt; &lt;USDT本金&gt; &lt;杠杆倍数&gt; [限价]\n例如: /sell ETHUSDT 500 10 1800").parse_mode(teloxide::types::ParseMode::Html).await?;
                 return Ok(());
             }
             let symbol = parts[0].to_uppercase();
             let margin_usdt = Decimal::from_str(parts[1]).unwrap_or_default();
             let leverage = Decimal::from_str(parts[2]).unwrap_or(dec!(1));
+            let limit_price = if parts.len() == 4 { Decimal::from_str(parts[3]).ok() } else { None };
             
             if let Some(ctx) = contexts.get(&symbol) {
-                // 1. 设置真实杠杆倍数
                 let lev_u32 = leverage.to_u32().unwrap_or(1);
                 let _ = exec_client.set_leverage(&symbol, lev_u32).await;
 
-                // 2. 盘口估价与数量计算
-                let estimated_entry = ctx.ob_manager.book.read().unwrap().bids.iter().next_back().map(|(p, _)| *p).unwrap_or(dec!(1));
+                let estimated_entry = limit_price.unwrap_or_else(|| ctx.ob_manager.book.read().unwrap().bids.iter().next_back().map(|(p, _)| *p).unwrap_or(dec!(1)));
                 let notional = margin_usdt * leverage;
                 let mut target_qty = notional / estimated_entry;
-                let precision = match symbol.as_str() {
-                    "BTCUSDT" => 3,
-                    "ETHUSDT" => 3,
-                    "BNBUSDT" => 2,
-                    _ => 0,
+                
+                let mut limit_price_str = String::new();
+                if let Some(info) = exchange_info.get(&symbol) {
+                    if info.step_size > Decimal::ZERO {
+                        let steps = (target_qty / info.step_size).floor();
+                        target_qty = steps * info.step_size;
+                    }
+                    if let Some(mut lp) = limit_price {
+                        if info.tick_size > Decimal::ZERO {
+                            let steps = (lp / info.tick_size).floor();
+                            lp = steps * info.tick_size;
+                        }
+                        limit_price_str = lp.normalize().to_string();
+                    }
+                }
+                
+                let qty_str = target_qty.normalize().to_string();
+                
+                let res = if let Some(_) = limit_price {
+                    exec_client.place_limit_order(&symbol, "SELL", &qty_str, &limit_price_str).await.map(|_| Decimal::ZERO)
+                } else {
+                    exec_client.place_order(&symbol, "SELL", "MARKET", &qty_str, false).await.map_err(|e| e.to_string())
                 };
-                target_qty.rescale(precision);
 
-                bot.send_message(msg.chat.id, format!("⚡️ 准备市价做空 {}...\n本金: {} U | 杠杆: {}x\n计算下单量: {} 个币", 
-                    symbol, margin_usdt, leverage, target_qty)).await?;
-                
-                // 3. 执行真实市价单
-                let qty_str = target_qty.to_string();
-                let res = exec_client.place_order(&symbol, "SELL", "MARKET", &qty_str, false).await;
-                
                 match res {
                     Ok(real_avg_price) => {
-                        // 4. 解析真实的成交均价
-                        let fill_price = if real_avg_price > Decimal::ZERO { real_avg_price } else { estimated_entry };
-                        
-                        let _ = ctx.control_tx.send(ControlMessage::TradeExecuted {
-                            trade_qty: -target_qty, // 卖出是负数
-                            fill_price,
-                        }).await;
-                        
-                        bot.send_message(msg.chat.id, format!("✅ {} 做空成功！\n真实成交均价 (Fill Price): {}\n已写入硬盘并挂载移动止损。", symbol, fill_price)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                        if limit_price.is_some() {
+                            bot.send_message(msg.chat.id, format!("✅ <b>[{}] 限价做空 (SELL LIMIT) 下单成功！</b>\n\n🎯 限价: <b>{}</b>\n📦 数量: {}\n\n💡 <i>当订单被币安撮合成交后，引擎的“自愈轮询器”会在 10 秒内自动发现仓位并挂载保护。</i>", symbol, limit_price_str, qty_str)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                        } else {
+                            let fill_price = if real_avg_price > Decimal::ZERO { real_avg_price } else { estimated_entry };
+                            let _ = ctx.control_tx.send(ControlMessage::TradeExecuted {
+                                trade_qty: -target_qty, // 卖出空单数量为负
+                                fill_price,
+                            }).await;
+                            bot.send_message(msg.chat.id, format!("✅ <b>[{}] 市价做空成功！</b>\n\n🎯 真实均价: <b>{}</b>\n📦 下单量: {}\n\n💡 <i>当前仓位已被接管。</i>", symbol, fill_price, qty_str)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                        }
                     }
                     Err(e) => { bot.send_message(msg.chat.id, format!("❌ 订单失败：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
                 }
