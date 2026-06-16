@@ -24,7 +24,7 @@ enum Command {
     Panic(String),
     #[command(description = "一键市价全平 (真实平仓并清空记忆)。用法: /close <交易对>")]
     Close(String),
-    #[command(description = "从币安同步真实仓位并开启监控。用法: /sync <交易对>")]
+    #[command(description = "同步仓位并开启监控。全局同步用法: /sync，单个同步: /sync <交易对>")]
     Sync(String),
     #[command(description = "检查交易所连接")]
     Status,

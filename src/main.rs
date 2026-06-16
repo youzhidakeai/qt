@@ -183,17 +183,36 @@ async fn main() {
                         let key = format!("{}_state", sym);
                         if let Ok(state_content) = redis::cmd("GET").arg(&key).query_async::<String>(&mut con).await {
                             if let Ok(state) = serde_json::from_str::<serde_json::Value>(&state_content) {
-                                let amt_str = state.get("position_amt").and_then(|v| v.as_str()).unwrap_or("0");
-                                if let Ok(amt) = Decimal::from_str(amt_str) {
-                                if amt.abs() > Decimal::ZERO {
-                                    let entry = state.get("entry_price").and_then(|v| v.as_str()).unwrap_or("0").parse::<Decimal>().unwrap_or_default();
+                                let amt_str = match state.get("position_amt") {
+                                    Some(serde_json::Value::String(s)) => s.to_string(),
+                                    Some(serde_json::Value::Number(n)) => n.to_string(),
+                                    _ => "0".to_string(),
+                                };
+                                if let Ok(amt) = rust_decimal::Decimal::from_str(&amt_str) {
+                                if amt.abs() > rust_decimal::Decimal::ZERO {
+                                    let entry_str = match state.get("entry_price") {
+                                        Some(serde_json::Value::String(s)) => s.to_string(),
+                                        Some(serde_json::Value::Number(n)) => n.to_string(),
+                                        _ => "0".to_string(),
+                                    };
+                                    let entry = entry_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
                                     let unpnl = (price - entry) * amt; // gross pnl
-                                    let sl_price = if amt > Decimal::ZERO {
-                                        let high = state.get("highest_price_since_entry").and_then(|v| v.as_str()).unwrap_or("0").parse::<Decimal>().unwrap_or_default();
-                                        high * (Decimal::ONE - Decimal::from_str("0.015").unwrap())
+                                    let sl_price = if amt > rust_decimal::Decimal::ZERO {
+                                        let high_str = match state.get("highest_price_since_entry") {
+                                            Some(serde_json::Value::String(s)) => s.to_string(),
+                                            Some(serde_json::Value::Number(n)) => n.to_string(),
+                                            _ => "0".to_string(),
+                                        };
+                                        let high = high_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
+                                        high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.008").unwrap())
                                     } else {
-                                        let low = state.get("lowest_price_since_entry").and_then(|v| v.as_str()).unwrap_or("0").parse::<Decimal>().unwrap_or_default();
-                                        low * (Decimal::ONE + Decimal::from_str("0.015").unwrap())
+                                        let low_str = match state.get("lowest_price_since_entry") {
+                                            Some(serde_json::Value::String(s)) => s.to_string(),
+                                            Some(serde_json::Value::Number(n)) => n.to_string(),
+                                            _ => "0".to_string(),
+                                        };
+                                        let low = low_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
+                                        low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.008").unwrap())
                                     };
                                     
                                     let dir = if amt > Decimal::ZERO { "🟢 多" } else { "🔴 空" };
