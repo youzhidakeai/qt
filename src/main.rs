@@ -224,7 +224,13 @@ async fn main() {
             
             for sym in sym_keys {
                 if let Some(ctx) = tg_ctx_ticker.get(sym) {
-                    let price = ctx.ob_manager.book.read().unwrap().bids.iter().next_back().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
+                    let (bid_price, ask_price) = {
+                        let ob = ctx.ob_manager.book.read().unwrap();
+                        let b = ob.bids.iter().next_back().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
+                        let a = ob.asks.iter().next().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
+                        (b, a)
+                    };
+                    let price = bid_price; // 保持原有用于涨跌幅计算的基准
                     
                     let mut extra_info = String::new();
                     if let Ok(mut con) = redis_ticker.get_multiplexed_async_connection().await {
@@ -244,7 +250,13 @@ async fn main() {
                                         _ => "0".to_string(),
                                     };
                                     let entry = entry_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
-                                    let unpnl = (price - entry) * amt; // gross pnl
+                                    
+                                    // 多单算平仓收益看买盘(bid)，空单算平仓收益看卖盘(ask)
+                                    let unpnl = if amt > Decimal::ZERO {
+                                        (bid_price - entry) * amt
+                                    } else {
+                                        (ask_price - entry) * amt
+                                    };
                                     let sl_price = if amt > rust_decimal::Decimal::ZERO {
                                         let high_str = match state.get("highest_price_since_entry") {
                                             Some(serde_json::Value::String(s)) => s.to_string(),

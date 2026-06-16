@@ -23,12 +23,14 @@ pub struct BinanceExecutionClient {
 
 impl BinanceExecutionClient {
     pub fn new(api_key: &str, api_secret: &str) -> Self {
+        let base_url = std::env::var("BINANCE_BASE_URL")
+            .unwrap_or_else(|_| "https://fapi.binance.com".to_string()); // 默认使用正式主网
+            
         Self {
             api_key: api_key.to_string(),
             api_secret: api_secret.to_string(),
             client: Client::new(),
-            // 切换到币安 U本位合约 测试网 (Testnet) 端点
-            base_url: "https://testnet.binancefuture.com".to_string(), 
+            base_url, 
         }
     }
 

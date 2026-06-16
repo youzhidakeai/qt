@@ -7,7 +7,8 @@ use std::time::Duration;
 use crate::models::{DepthUpdate, AggTradeUpdate};
 
 pub async fn run_binance_ws(symbol: &str, tx: mpsc::Sender<DepthUpdate>) {
-    let ws_url = format!("wss://stream.binancefuture.com/ws/{}@depth@100ms", symbol.to_lowercase());
+    let base_ws = std::env::var("BINANCE_WS_URL").unwrap_or_else(|_| "wss://fstream.binance.com/ws".to_string());
+    let ws_url = format!("{}/{}@depth@100ms", base_ws, symbol.to_lowercase());
     let mut retry_delay = 1;
 
     loop {
@@ -45,7 +46,8 @@ pub async fn run_binance_ws(symbol: &str, tx: mpsc::Sender<DepthUpdate>) {
 }
 
 pub async fn run_aggtrade_ws(symbol: &str, tx: mpsc::Sender<AggTradeUpdate>) {
-    let ws_url = format!("wss://stream.binancefuture.com/ws/{}@aggTrade", symbol.to_lowercase());
+    let base_ws = std::env::var("BINANCE_WS_URL").unwrap_or_else(|_| "wss://fstream.binance.com/ws".to_string());
+    let ws_url = format!("{}/{}@aggTrade", base_ws, symbol.to_lowercase());
     let mut retry_delay = 1;
 
     loop {
