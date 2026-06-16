@@ -265,8 +265,8 @@ async fn main() {
                                         };
                                         let high = high_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
                                         let current_profit_pct = (high - entry) / entry * rust_decimal::Decimal::from_str("100").unwrap();
-                                        if current_profit_pct >= rust_decimal::Decimal::ONE {
-                                            high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.01").unwrap())
+                                        if current_profit_pct >= rust_decimal::Decimal::from_str("3.0").unwrap() {
+                                            high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.015").unwrap())
                                         } else {
                                             entry * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.025").unwrap())
                                         }
@@ -278,8 +278,8 @@ async fn main() {
                                         };
                                         let low = low_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
                                         let current_profit_pct = (entry - low) / entry * rust_decimal::Decimal::from_str("100").unwrap();
-                                        if current_profit_pct >= rust_decimal::Decimal::ONE {
-                                            low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.01").unwrap())
+                                        if current_profit_pct >= rust_decimal::Decimal::from_str("3.0").unwrap() {
+                                            low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.015").unwrap())
                                         } else {
                                             entry * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.025").unwrap())
                                         }
