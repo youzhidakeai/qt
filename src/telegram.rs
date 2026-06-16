@@ -262,11 +262,37 @@ async fn answer(
         }
         Command::Sync(args) => {
             let symbol = args.trim().to_uppercase();
-            if let Some(ctx) = contexts.get(&symbol) {
-                let _ = ctx.control_tx.send(ControlMessage::SyncPosition).await;
-                bot.send_message(msg.chat.id, format!("⌛️ 正在从币安同步 {} 的真实仓位数据...", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+            if symbol.is_empty() {
+                bot.send_message(msg.chat.id, "⌛️ 正在从币安拉取全网真实仓位，请稍候...").await?;
+                match exec_client.check_positions().await {
+                    Ok(pos_str) => {
+                        let positions: Vec<serde_json::Value> = serde_json::from_str(&pos_str).unwrap_or_default();
+                        let mut synced_count = 0;
+                        for pos in positions {
+                            let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+                            if amt.abs() > rust_decimal::Decimal::ZERO {
+                                let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                if let Some(ctx) = contexts.get(&sym) {
+                                    let _ = ctx.control_tx.send(ControlMessage::SyncPosition).await;
+                                    synced_count += 1;
+                                    // 延迟避免并发请求触发币安流控
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                }
+                            }
+                        }
+                        bot.send_message(msg.chat.id, format!("✅ 全网同步指令分发完毕！共唤醒了 {} 个遗留仓位的大脑开始防守。", synced_count)).await?;
+                    }
+                    Err(e) => {
+                        bot.send_message(msg.chat.id, format!("❌ 拉取全网仓位失败: {}", e)).await?;
+                    }
+                }
             } else {
-                bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                if let Some(ctx) = contexts.get(&symbol) {
+                    let _ = ctx.control_tx.send(ControlMessage::SyncPosition).await;
+                    bot.send_message(msg.chat.id, format!("⌛️ 正在从币安同步 {} 的真实仓位数据...", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                } else {
+                    bot.send_message(msg.chat.id, format!("⚠️ 系统未订阅交易对: {}", symbol)).parse_mode(teloxide::types::ParseMode::Html).await?;
+                }
             }
         }
         Command::Status => {
