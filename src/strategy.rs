@@ -71,6 +71,8 @@ pub struct StrategyEngine {
     pub mid_price_history: VecDeque<Decimal>,
     pub breakout_window: usize,
     
+    pub initial_sl_pct: Decimal,
+    pub activation_pct: Decimal,
     pub trailing_sl_pct: Decimal,
     pub round_trip_fee_pct: Decimal,
 
@@ -125,7 +127,9 @@ impl StrategyEngine {
             redis_client,
             mid_price_history: VecDeque::with_capacity(300),
             breakout_window: 300,
-            trailing_sl_pct: dec!(1.5), // 【优化】将回撤容忍度放宽到 1.5%，防止被山寨币的正常波动（白噪音）频繁止损扫地出门
+            initial_sl_pct: dec!(2.5),
+            activation_pct: dec!(1.0),
+            trailing_sl_pct: dec!(1.0),
             round_trip_fee_pct: dec!(0.1),
             taker_buy_flow: Decimal::ZERO,
             taker_sell_flow: Decimal::ZERO,
@@ -406,7 +410,12 @@ impl StrategyEngine {
                         self.position.highest_price_since_entry = bid;
                         state_changed = true;
                     }
-                    let dynamic_sl_price = self.position.highest_price_since_entry * (dec!(1) - self.trailing_sl_pct / dec!(100));
+                    let current_profit_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100);
+                    let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
+                        self.position.highest_price_since_entry * (dec!(1) - self.trailing_sl_pct / dec!(100))
+                    } else {
+                        self.position.entry_price * (dec!(1) - self.initial_sl_pct / dec!(100))
+                    };
 
                     if bid <= dynamic_sl_price {
                         let gross_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100);
@@ -414,6 +423,7 @@ impl StrategyEngine {
                         let gross_pnl_usdt = (bid - self.position.entry_price) * self.position.position_amt;
                         let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * bid) * dec!(0.0005);
                         let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
+                        self.record_trade_history("LONG", bid, gross_pnl_usdt, fee_usdt, net_pnl_usdt).await;
                         
                         info!("🏁 [{}] 多单离场信号！正在向交易所发送市价卖出（平多）指令...", self.position.symbol);
                         
@@ -437,7 +447,12 @@ impl StrategyEngine {
                         self.position.lowest_price_since_entry = ask;
                         state_changed = true;
                     }
-                    let dynamic_sl_price = self.position.lowest_price_since_entry * (dec!(1) + self.trailing_sl_pct / dec!(100));
+                    let current_profit_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100);
+                    let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
+                        self.position.lowest_price_since_entry * (dec!(1) + self.trailing_sl_pct / dec!(100))
+                    } else {
+                        self.position.entry_price * (dec!(1) + self.initial_sl_pct / dec!(100))
+                    };
 
                     if ask >= dynamic_sl_price {
                         let gross_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100);
@@ -446,6 +461,7 @@ impl StrategyEngine {
                         let gross_pnl_usdt = (self.position.entry_price - ask) * self.position.position_amt.abs();
                         let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * ask) * dec!(0.0005);
                         let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
+                        self.record_trade_history("SHORT", ask, gross_pnl_usdt, fee_usdt, net_pnl_usdt).await;
                         
                         info!("🏁 [{}] 空单离场信号！正在向交易所发送市价买入（平空）指令...", self.position.symbol);
                         
@@ -470,6 +486,28 @@ impl StrategyEngine {
             if state_changed {
                 self.position.save_state(&self.redis_client).await;
             }
+        }
+    }
+
+    async fn record_trade_history(&self, side: &str, exit_price: Decimal, gross_pnl: Decimal, fee: Decimal, net_pnl: Decimal) {
+        let now = time::OffsetDateTime::now_utc();
+        let date_str = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
+        let key = format!("trade_history_{}", date_str);
+        
+        let trade = serde_json::json!({
+            "symbol": self.position.symbol,
+            "side": side,
+            "entry_price": self.position.entry_price.to_string(),
+            "exit_price": exit_price.to_string(),
+            "gross_pnl_usdt": gross_pnl.to_string(),
+            "fee_usdt": fee.to_string(),
+            "net_pnl_usdt": net_pnl.to_string(),
+            "timestamp": now.unix_timestamp(),
+        });
+        
+        if let Ok(mut con) = self.redis_client.get_multiplexed_async_connection().await {
+            let _: redis::RedisResult<()> = redis::cmd("RPUSH").arg(&key).arg(trade.to_string()).query_async(&mut con).await;
+            let _: redis::RedisResult<()> = redis::cmd("EXPIRE").arg(&key).arg(604800).query_async(&mut con).await; // 7 days
         }
     }
 }

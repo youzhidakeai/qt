@@ -264,7 +264,12 @@ async fn main() {
                                             _ => "0".to_string(),
                                         };
                                         let high = high_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
-                                        high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.015").unwrap())
+                                        let current_profit_pct = (high - entry) / entry * rust_decimal::Decimal::from_str("100").unwrap();
+                                        if current_profit_pct >= rust_decimal::Decimal::ONE {
+                                            high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.01").unwrap())
+                                        } else {
+                                            entry * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.025").unwrap())
+                                        }
                                     } else {
                                         let low_str = match state.get("lowest_price_since_entry") {
                                             Some(serde_json::Value::String(s)) => s.to_string(),
@@ -272,7 +277,12 @@ async fn main() {
                                             _ => "0".to_string(),
                                         };
                                         let low = low_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
-                                        low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.015").unwrap())
+                                        let current_profit_pct = (entry - low) / entry * rust_decimal::Decimal::from_str("100").unwrap();
+                                        if current_profit_pct >= rust_decimal::Decimal::ONE {
+                                            low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.01").unwrap())
+                                        } else {
+                                            entry * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.025").unwrap())
+                                        }
                                     };
                                     
                                     let dir = if amt > Decimal::ZERO { "🟢 多" } else { "🔴 空" };
