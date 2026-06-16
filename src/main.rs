@@ -264,7 +264,7 @@ async fn main() {
                                             _ => "0".to_string(),
                                         };
                                         let high = high_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
-                                        high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.008").unwrap())
+                                        high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.015").unwrap())
                                     } else {
                                         let low_str = match state.get("lowest_price_since_entry") {
                                             Some(serde_json::Value::String(s)) => s.to_string(),
@@ -272,7 +272,7 @@ async fn main() {
                                             _ => "0".to_string(),
                                         };
                                         let low = low_str.parse::<rust_decimal::Decimal>().unwrap_or_default();
-                                        low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.008").unwrap())
+                                        low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.015").unwrap())
                                     };
                                     
                                     let dir = if amt > Decimal::ZERO { "🟢 多" } else { "🔴 空" };

@@ -125,7 +125,7 @@ impl StrategyEngine {
             redis_client,
             mid_price_history: VecDeque::with_capacity(300),
             breakout_window: 300,
-            trailing_sl_pct: dec!(0.8), // 【优化】将回撤容忍度从 1.5% 缩小到 0.8%，在 10倍杠杆下这能锁定绝大部分利润
+            trailing_sl_pct: dec!(1.5), // 【优化】将回撤容忍度放宽到 1.5%，防止被山寨币的正常波动（白噪音）频繁止损扫地出门
             round_trip_fee_pct: dec!(0.1),
             taker_buy_flow: Decimal::ZERO,
             taker_sell_flow: Decimal::ZERO,
