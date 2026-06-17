@@ -89,6 +89,7 @@ pub struct StrategyEngine {
     
     // Telegram 推送通道
     pub tg_tx: mpsc::Sender<String>,
+    pub feature_tx: mpsc::Sender<String>,
     
     // 日志计数器
     pub tick_counter: u64,
@@ -110,6 +111,7 @@ impl StrategyEngine {
         redis_client: redis::Client,
         signal_tx: mpsc::Sender<crate::portfolio::SignalEvent>,
         tg_tx: mpsc::Sender<String>,
+        feature_tx: mpsc::Sender<String>,
     ) -> Self {
         let position = match PositionManager::load_state(symbol, &redis_client).await {
             Some(pm) => pm,
@@ -141,6 +143,7 @@ impl StrategyEngine {
             auto_margin_usdt: dec!(50.0),
             auto_leverage: 10,
             tg_tx,
+            feature_tx,
             tick_counter: 0,
             signal_tx,
             last_signal_time: None,
@@ -391,6 +394,13 @@ impl StrategyEngine {
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
+                    
+                    // 异步特征采集流水线 (零延迟)
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let feature_json = format!(r#"{{"sym":"{}","ts":{},"p":{:.4},"obi":{:.4},"buy_f":{:.4},"sell_f":{:.4},"fund":{:.4},"prob":{:.4}}}"#,
+                        self.position.symbol, timestamp, bid, obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, ml_prob);
+                    let _ = self.feature_tx.try_send(feature_json);
+
                     if is_strong || ml_prob > dec!(0.75) {
                         info!("🚀 [{}] 触发做多信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
                         
@@ -410,6 +420,12 @@ impl StrategyEngine {
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "SELL", &self.mid_price_history);
+
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let feature_json = format!(r#"{{"sym":"{}","ts":{},"p":{:.4},"obi":{:.4},"buy_f":{:.4},"sell_f":{:.4},"fund":{:.4},"prob":{:.4}}}"#,
+                        self.position.symbol, timestamp, ask, obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, ml_prob);
+                    let _ = self.feature_tx.try_send(feature_json);
+
                     if is_strong || ml_prob > dec!(0.75) {
                         info!("💥 [{}] 触发做空信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
 

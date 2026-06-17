@@ -94,9 +94,25 @@ async fn main() {
     let mut tg_contexts = HashMap::new();
     let mut control_senders = HashMap::new();
 
-    for symbol in &symbols {
-        let sym_str = symbol.to_string();
-        
+    let (feature_tx, mut feature_rx) = mpsc::channel::<String>(100000);
+    
+    let redis_logger = redis_client.clone();
+    tokio::spawn(async move {
+        if let Ok(mut con) = redis_logger.get_multiplexed_async_connection().await {
+            while let Some(json_str) = feature_rx.recv().await {
+                let _: () = redis::cmd("XADD")
+                    .arg("ML_FEATURE_STREAM")
+                    .arg("MAXLEN").arg("~").arg("500000") // 保留最近50万条防止内存撑爆
+                    .arg("*")
+                    .arg("data")
+                    .arg(json_str)
+                    .query_async(&mut con).await.unwrap_or_default();
+            }
+        }
+    });
+
+    for sym in symbols.iter() {
+        let sym_str = sym.clone();
         let ob_manager = Arc::new(OrderBookManager::new(&sym_str));
         let (tx, mut rx) = mpsc::channel::<DepthUpdate>(1000);
         let (agg_tx, mut agg_rx) = mpsc::channel::<AggTradeUpdate>(1000);
@@ -127,9 +143,10 @@ async fn main() {
         let sig_tx = signal_tx.clone();
         let exec_clone = exec_client.clone();
         let tg_tx_clone = tg_tx.clone();
+        let feat_tx_clone = feature_tx.clone();
         
         tokio::spawn(async move {
-            let mut brain = StrategyEngine::new(exec_clone, ob_clone.clone(), control_tx, &brain_sym, r_client, sig_tx, tg_tx_clone).await;
+            let mut brain = StrategyEngine::new(exec_clone, ob_clone.clone(), control_tx, &brain_sym, r_client, sig_tx, tg_tx_clone, feat_tx_clone).await;
             loop {
                 tokio::select! {
                     Some(update) = rx.recv() => {
