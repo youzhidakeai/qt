@@ -102,7 +102,6 @@ async fn main() {
             while let Some(json_str) = feature_rx.recv().await {
                 let _: () = redis::cmd("XADD")
                     .arg("ML_FEATURE_STREAM")
-                    .arg("MAXLEN").arg("~").arg("500000") // 保留最近50万条防止内存撑爆
                     .arg("*")
                     .arg("data")
                     .arg(json_str)
