@@ -58,92 +58,48 @@ impl PortfolioManager {
 
         if total_wallet <= Decimal::ZERO { return; }
 
+        let pos_str = self.exec_client.check_positions().await.unwrap_or_default();
+        let positions: Vec<serde_json::Value> = serde_json::from_str(&pos_str).unwrap_or_default();
+        
+        let mut active_count = 0;
+        let mut has_existing_pos = false;
+        for pos in &positions {
+            let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+            if amt.abs() > rust_decimal::Decimal::ZERO {
+                active_count += 1;
+                let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                if sym == signal.symbol {
+                    has_existing_pos = true;
+                }
+            }
+        }
+
+        if has_existing_pos {
+            info!("⚠️ [中央大脑] {} 已经持有仓位，拒绝重复开仓。", signal.symbol);
+            return;
+        }
+
+        if active_count >= 3 {
+            info!("⚠️ [中央大脑] 当前已持有 {} 个仓位，达到系统并发上限 (3)，拒绝新信号 {}。", active_count, signal.symbol);
+            return;
+        }
+
         let leverage = 10;
         let target_margin = total_wallet * rust_decimal_macros::dec!(0.10);
         
         let usable_margin = if avail_balance >= target_margin {
             target_margin
         } else {
-            avail_balance * rust_decimal_macros::dec!(0.95) // 保留一点缓冲防爆仓
+            avail_balance * rust_decimal_macros::dec!(0.95)
         };
         
         if usable_margin < rust_decimal_macros::dec!(5.0) {
-            if signal.strength == "S" {
-                info!("⚠️ [中央大脑] 可用资金不足(剩余: {})，启动跨币种强平调配...", avail_balance);
-                self.free_up_margin_and_trade(signal).await;
-            } else {
-                info!("⚠️ [中央大脑] 资金不足(剩余: {})且信号仅为 A 级，放弃交易。", avail_balance);
-            }
+            info!("⚠️ [中央大脑] 可用资金不足(剩余: {})，放弃交易。", avail_balance);
             return;
         }
 
         let notional = usable_margin * Decimal::from(leverage);
         self.execute_trade(&signal.symbol, &signal.side, notional, signal.price).await;
-    }
-
-    async fn free_up_margin_and_trade(&mut self, signal: SignalEvent) {
-        let pos_str = match self.exec_client.check_positions().await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let positions: Vec<serde_json::Value> = serde_json::from_str(&pos_str).unwrap_or_default();
-        
-        let mut largest_pos_sym = String::new();
-        let mut largest_pos_amt = Decimal::ZERO;
-        let mut largest_pos_side = String::new();
-
-        for pos in positions {
-            let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-            if sym == signal.symbol { continue; } // 不要平自己
-            
-            let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
-            if amt.abs() > largest_pos_amt.abs() {
-                largest_pos_amt = amt;
-                largest_pos_sym = sym.to_string();
-                largest_pos_side = if amt > Decimal::ZERO { "SELL".to_string() } else { "BUY".to_string() }; // 反向平仓
-            }
-        }
-
-        if largest_pos_amt.abs() > Decimal::ZERO {
-            // 强平 30%
-            let reduce_amt = largest_pos_amt.abs() * rust_decimal_macros::dec!(0.30);
-            
-            let mut qty_to_reduce = reduce_amt;
-            if let Some(info) = self.exchange_info.get(&largest_pos_sym) {
-                let step_size = info.step_size;
-                if step_size > rust_decimal::Decimal::ZERO {
-                    let steps = (qty_to_reduce / step_size).floor();
-                    qty_to_reduce = steps * step_size;
-                }
-            }
-
-            if qty_to_reduce > Decimal::ZERO {
-                info!("🔪 [中央大脑] 正在强平 {} 的 30% 仓位 (量: {})，为 {} 腾出子弹！", largest_pos_sym, qty_to_reduce, signal.symbol);
-                let qty_str = qty_to_reduce.normalize().to_string();
-                if let Ok(fill_price) = self.exec_client.place_order(&largest_pos_sym, &largest_pos_side, "MARKET", &qty_str, true).await {
-                    if let Some(tx) = self.control_senders.get(&largest_pos_sym) {
-                        let trade_qty = if largest_pos_side == "BUY" { qty_to_reduce } else { -qty_to_reduce };
-                        let _ = tx.send(ControlMessage::TradeExecuted { trade_qty, fill_price }).await;
-                    }
-                    let notional_freed = qty_to_reduce * fill_price;
-                    let _ = self.tg_tx.send(format!("🔪 <b>中央大脑资金调配</b>\n为了执行 {} 的信号，已强行平掉 {} 的 30% 仓位 (释放价值: {:.2} USDT) 腾出保证金！", signal.symbol, largest_pos_sym, notional_freed)).await;
-                    
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                    
-                    if let Ok(account_str) = self.exec_client.check_account().await {
-                        if let Ok(account) = serde_json::from_str::<serde_json::Value>(&account_str) {
-                            let new_avail = account.get("availableBalance").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
-                            if new_avail >= rust_decimal_macros::dec!(5.0) {
-                                let new_notional = new_avail * rust_decimal_macros::dec!(0.95) * Decimal::from(10);
-                                self.execute_trade(&signal.symbol, &signal.side, new_notional, signal.price).await;
-                            } else {
-                                let _ = self.tg_tx.send(format!("❌ <b>中央大脑调配失败</b>\n虽平仓 {}，但剩余保证金 ({}) 依然不足 5 USDT，放弃狙击 {}。", largest_pos_sym, new_avail, signal.symbol)).await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     async fn execute_trade(&self, symbol: &str, side: &str, notional: Decimal, est_price: Decimal) {
