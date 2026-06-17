@@ -246,16 +246,43 @@ async fn main() {
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
 
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
-        let mut last_prices: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
+        let mut last_prices: std::collections::HashMap<String, rust_decimal::Decimal> = std::collections::HashMap::new();
+        let mut global_last_prices: std::collections::HashMap<String, rust_decimal::Decimal> = std::collections::HashMap::new();
+        
         loop {
             interval.tick().await;
             let mut report = String::from("⏱️ <b>[行情 5 分钟雷达扫瞄]</b>\n");
             let mut coins_report = String::new();
             
-            let mut up_count = 0;
-            let mut down_count = 0;
-            let mut total_pct = rust_decimal::Decimal::ZERO;
-            let mut valid_coins = 0;
+            // 1. 获取全市场真实大盘情绪
+            let mut global_up_count = 0;
+            let mut global_down_count = 0;
+            let mut global_total_pct = rust_decimal::Decimal::ZERO;
+            let mut global_valid = 0;
+            
+            if let Ok(res) = reqwest::get("https://fapi.binance.com/fapi/v1/ticker/price").await {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    if let Some(arr) = json.as_array() {
+                        for item in arr {
+                            if let (Some(sym), Some(price_str)) = (item.get("symbol").and_then(|v| v.as_str()), item.get("price").and_then(|v| v.as_str())) {
+                                if !sym.ends_with("USDT") { continue; }
+                                if let Ok(price) = rust_decimal::Decimal::from_str(price_str) {
+                                    if let Some(last_p) = global_last_prices.get(sym) {
+                                        if *last_p > rust_decimal::Decimal::ZERO {
+                                            let pct = (price - *last_p) / *last_p * rust_decimal_macros::dec!(100);
+                                            if pct > rust_decimal::Decimal::ZERO { global_up_count += 1; }
+                                            else if pct < rust_decimal::Decimal::ZERO { global_down_count += 1; }
+                                            global_total_pct += pct;
+                                            global_valid += 1;
+                                        }
+                                    }
+                                    global_last_prices.insert(sym.to_string(), price);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let mut sym_keys: Vec<&String> = tg_ctx_ticker.keys().collect();
             sym_keys.sort(); // 保持固定的字母顺序
@@ -334,22 +361,18 @@ async fn main() {
 
                     let mut delta_str = String::new();
                     if let Some(last_p) = last_prices.get(sym) {
-                        if *last_p > Decimal::ZERO && price > Decimal::ZERO {
+                        if *last_p > rust_decimal::Decimal::ZERO && price > rust_decimal::Decimal::ZERO {
                             let pct = (price - *last_p) / *last_p * rust_decimal_macros::dec!(100);
-                            if pct > Decimal::ZERO {
+                            if pct > rust_decimal::Decimal::ZERO {
                                 delta_str = format!(" (📈 +{:.3}%)", pct);
-                                up_count += 1;
-                            } else if pct < Decimal::ZERO {
+                            } else if pct < rust_decimal::Decimal::ZERO {
                                 delta_str = format!(" (📉 {:.3}%)", pct);
-                                down_count += 1;
                             } else {
                                 delta_str = format!(" (➖ 0.000%)");
                             }
-                            total_pct += pct;
-                            valid_coins += 1;
                         }
                     }
-                    if price > Decimal::ZERO {
+                    if price > rust_decimal::Decimal::ZERO {
                         last_prices.insert((*sym).clone(), price);
                         coins_report.push_str(&format!("🔹 <b>{}</b>: {}{}{}\n", sym, price, delta_str, extra_info));
                     } else {
@@ -358,25 +381,25 @@ async fn main() {
                 }
             }
             
-            if valid_coins > 0 {
-                let avg_pct = total_pct / rust_decimal::Decimal::from(valid_coins);
-                let sentiment = if avg_pct > rust_decimal_macros::dec!(0.3) {
-                    "🔥 市场狂热 (全线拉升)"
-                } else if avg_pct > rust_decimal_macros::dec!(0.1) && up_count > down_count {
-                    "📈 偏向乐观 (缓慢上涨)"
-                } else if avg_pct < rust_decimal_macros::dec!(-0.3) {
-                    "🩸 市场恐慌 (全线暴跌)"
-                } else if avg_pct < rust_decimal_macros::dec!(-0.1) && down_count > up_count {
-                    "📉 偏向悲观 (震荡阴跌)"
+            if global_valid > 0 {
+                let avg_pct = global_total_pct / rust_decimal::Decimal::from(global_valid);
+                let sentiment = if avg_pct > rust_decimal_macros::dec!(0.2) {
+                    "🔥 市场狂热 (全线爆发)"
+                } else if avg_pct > rust_decimal_macros::dec!(0.05) && global_up_count > global_down_count {
+                    "📈 偏向乐观 (多军控盘)"
+                } else if avg_pct < rust_decimal_macros::dec!(-0.2) {
+                    "🩸 市场恐慌 (全线血洗)"
+                } else if avg_pct < rust_decimal_macros::dec!(-0.05) && global_down_count > global_up_count {
+                    "📉 偏向悲观 (空军压制)"
                 } else {
-                    "⚖️ 震荡洗盘 (多空焦灼)"
+                    "⚖️ 震荡洗盘 (多空互博)"
                 };
                 
-                report.push_str(&format!("📊 <b>大盘情绪:</b> {}\n", sentiment));
-                report.push_str(&format!("⏱️ <b>5分钟均幅:</b> {:.3}%\n", avg_pct));
-                report.push_str(&format!("🟢 上涨: {} 只 | 🔴 下跌: {} 只\n\n", up_count, down_count));
+                report.push_str(&format!("📊 <b>全网真实大盘情绪 ({}只币):</b> {}\n", global_valid, sentiment));
+                report.push_str(&format!("⏱️ <b>全网5分钟均幅:</b> {:.3}%\n", avg_pct));
+                report.push_str(&format!("🟢 上涨: {} 只 | 🔴 下跌: {} 只\n\n", global_up_count, global_down_count));
             } else {
-                report.push_str("\n");
+                report.push_str("📊 <b>大盘情绪:</b> 全网数据收集中 (需等待下个5分钟)...\n\n");
             }
             report.push_str(&coins_report);
             
