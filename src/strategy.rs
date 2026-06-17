@@ -344,6 +344,15 @@ impl StrategyEngine {
                 }
             }
             self.last_tick_time = Some(now);
+            self.tick_counter += 1;
+            
+            if self.tick_counter % 10 == 0 { // 约每1秒推送一次特征切片到 Redis
+                let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
+                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                let feature_json = format!(r#"{{"sym":"{}","ts":{},"p":{:.4},"obi":{:.4},"buy_f":{:.4},"sell_f":{:.4},"fund":{:.4},"prob":{:.4}}}"#,
+                    self.position.symbol, timestamp, bid, obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, ml_prob);
+                let _ = self.feature_tx.try_send(feature_json);
+            }
 
             if self.mid_price_history.len() < self.breakout_window {
                 self.mid_price_history.push_back(mid_price);
@@ -360,16 +369,6 @@ impl StrategyEngine {
             // 更新历史窗口
             self.mid_price_history.pop_front();
             self.mid_price_history.push_back(mid_price);
-
-            self.tick_counter += 1;
-            
-            if self.tick_counter % 10 == 0 { // 约每1秒推送一次特征切片到 Redis
-                let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
-                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                let feature_json = format!(r#"{{"sym":"{}","ts":{},"p":{:.4},"obi":{:.4},"buy_f":{:.4},"sell_f":{:.4},"fund":{:.4},"prob":{:.4}}}"#,
-                    self.position.symbol, timestamp, bid, obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, ml_prob);
-                let _ = self.feature_tx.try_send(feature_json);
-            }
 
             if self.tick_counter % 100 == 0 { // 约每10秒打印一次
                 info!("🔍 [切片追踪 {}] 最新价: {} | 订单簿失衡指数(OBI): {:.3} | 快买/卖流: {:.2}/{:.2} | 慢买/卖流: {:.2}/{:.2} | 30s局部高/低点: {} / {}",
