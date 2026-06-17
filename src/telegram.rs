@@ -68,6 +68,14 @@ async fn answer(
     contexts: Arc<HashMap<String, SymbolContext>>,
     exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
 ) -> ResponseResult<()> {
+    let admin_chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+    let current_chat_id = msg.chat.id.to_string();
+
+    if !admin_chat_id.is_empty() && current_chat_id != admin_chat_id {
+        bot.send_message(msg.chat.id, "⛔️ <b>安全拦截</b>\n您无权调用此机构级交易终端。").parse_mode(teloxide::types::ParseMode::Html).await?;
+        return Ok(());
+    }
+
     match cmd {
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string()).parse_mode(teloxide::types::ParseMode::Html).await?;
