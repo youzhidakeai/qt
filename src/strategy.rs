@@ -432,7 +432,7 @@ impl StrategyEngine {
                         state_changed = true;
                     }
                     let current_profit_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100);
-                    let mut dynamic_sl_price = if current_profit_pct >= self.activation_pct {
+                    let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.highest_price_since_entry * (dec!(1) - self.trailing_sl_pct / dec!(100))
                     } else {
                         self.position.entry_price * (dec!(1) - self.initial_sl_pct / dec!(100))
@@ -480,7 +480,7 @@ impl StrategyEngine {
                         state_changed = true;
                     }
                     let current_profit_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100);
-                    let mut dynamic_sl_price = if current_profit_pct >= self.activation_pct {
+                    let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.lowest_price_since_entry * (dec!(1) + self.trailing_sl_pct / dec!(100))
                     } else {
                         self.position.entry_price * (dec!(1) + self.initial_sl_pct / dec!(100))
