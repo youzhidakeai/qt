@@ -257,22 +257,29 @@ async fn main() {
             // 1. 获取全市场真实大盘情绪
             let mut global_up_count = 0;
             let mut global_down_count = 0;
-            let mut global_total_pct = rust_decimal::Decimal::ZERO;
+            let mut global_weighted_pct_sum = rust_decimal::Decimal::ZERO;
+            let mut global_total_volume = rust_decimal::Decimal::ZERO;
             let mut global_valid = 0;
             
-            if let Ok(res) = reqwest::get("https://fapi.binance.com/fapi/v1/ticker/price").await {
+            if let Ok(res) = reqwest::get("https://fapi.binance.com/fapi/v1/ticker/24hr").await {
                 if let Ok(json) = res.json::<serde_json::Value>().await {
                     if let Some(arr) = json.as_array() {
                         for item in arr {
-                            if let (Some(sym), Some(price_str)) = (item.get("symbol").and_then(|v| v.as_str()), item.get("price").and_then(|v| v.as_str())) {
+                            if let (Some(sym), Some(price_str), Some(vol_str)) = (
+                                item.get("symbol").and_then(|v| v.as_str()), 
+                                item.get("lastPrice").and_then(|v| v.as_str()),
+                                item.get("quoteVolume").and_then(|v| v.as_str())
+                            ) {
                                 if !sym.ends_with("USDT") { continue; }
-                                if let Ok(price) = rust_decimal::Decimal::from_str(price_str) {
+                                if let (Ok(price), Ok(vol)) = (rust_decimal::Decimal::from_str(price_str), rust_decimal::Decimal::from_str(vol_str)) {
                                     if let Some(last_p) = global_last_prices.get(sym) {
                                         if *last_p > rust_decimal::Decimal::ZERO {
                                             let pct = (price - *last_p) / *last_p * rust_decimal_macros::dec!(100);
                                             if pct > rust_decimal::Decimal::ZERO { global_up_count += 1; }
                                             else if pct < rust_decimal::Decimal::ZERO { global_down_count += 1; }
-                                            global_total_pct += pct;
+                                            
+                                            global_weighted_pct_sum += pct * vol;
+                                            global_total_volume += vol;
                                             global_valid += 1;
                                         }
                                     }
@@ -381,8 +388,8 @@ async fn main() {
                 }
             }
             
-            if global_valid > 0 {
-                let avg_pct = global_total_pct / rust_decimal::Decimal::from(global_valid);
+            if global_valid > 0 && global_total_volume > rust_decimal::Decimal::ZERO {
+                let avg_pct = global_weighted_pct_sum / global_total_volume;
                 let sentiment = if avg_pct > rust_decimal_macros::dec!(0.2) {
                     "🔥 市场狂热 (全线爆发)"
                 } else if avg_pct > rust_decimal_macros::dec!(0.05) && global_up_count > global_down_count {
@@ -396,8 +403,8 @@ async fn main() {
                 };
                 
                 report.push_str(&format!("📊 <b>全网真实大盘情绪 ({}只币):</b> {}\n", global_valid, sentiment));
-                report.push_str(&format!("⏱️ <b>全网5分钟均幅:</b> {:.3}%\n", avg_pct));
-                report.push_str(&format!("🟢 上涨: {} 只 | 🔴 下跌: {} 只\n\n", global_up_count, global_down_count));
+                report.push_str(&format!("⏱️ <b>全网资金加权5分钟均幅:</b> {:.3}%\n", avg_pct));
+                report.push_str(&format!("🟢 上涨家数: {} | 🔴 下跌家数: {}\n\n", global_up_count, global_down_count));
             } else {
                 report.push_str("📊 <b>大盘情绪:</b> 全网数据收集中 (需等待下个5分钟)...\n\n");
             }
