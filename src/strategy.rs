@@ -470,7 +470,9 @@ impl StrategyEngine {
                     let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.highest_price_since_entry * (dec!(1) - self.trailing_sl_pct / dec!(100))
                     } else {
-                        self.position.entry_price * (dec!(1) - self.initial_sl_pct / dec!(100))
+                        // 扣除双边手续费，确保硬止损的净亏损不超过 initial_sl_pct
+                        let effective_sl_pct = self.initial_sl_pct - self.round_trip_fee_pct;
+                        self.position.entry_price * (dec!(1) - effective_sl_pct / dec!(100))
                     };
 
                     if current_profit_pct < self.activation_pct {
@@ -518,7 +520,9 @@ impl StrategyEngine {
                     let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.lowest_price_since_entry * (dec!(1) + self.trailing_sl_pct / dec!(100))
                     } else {
-                        self.position.entry_price * (dec!(1) + self.initial_sl_pct / dec!(100))
+                        // 扣除双边手续费，确保硬止损的净亏损不超过 initial_sl_pct
+                        let effective_sl_pct = self.initial_sl_pct - self.round_trip_fee_pct;
+                        self.position.entry_price * (dec!(1) + effective_sl_pct / dec!(100))
                     };
 
                     if current_profit_pct < self.activation_pct {
