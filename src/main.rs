@@ -341,8 +341,8 @@ async fn main() {
                                         let break_even_trigger = rust_decimal::Decimal::from_str("1.0").unwrap();
                                         let break_even_target = rust_decimal::Decimal::from_str("0.15").unwrap();
                                         
-                                        if current_profit_pct >= rust_decimal::Decimal::from_str("3.0").unwrap() {
-                                            high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.015").unwrap())
+                                        if current_profit_pct >= rust_decimal::Decimal::from_str("1.5").unwrap() {
+                                            high * (rust_decimal::Decimal::ONE - rust_decimal::Decimal::from_str("0.008").unwrap())
                                         } else if current_profit_pct >= break_even_trigger {
                                             entry * (rust_decimal::Decimal::ONE + break_even_target / rust_decimal::Decimal::from_str("100").unwrap())
                                         } else {
@@ -360,8 +360,8 @@ async fn main() {
                                         let break_even_trigger = rust_decimal::Decimal::from_str("1.0").unwrap();
                                         let break_even_target = rust_decimal::Decimal::from_str("0.15").unwrap();
                                         
-                                        if current_profit_pct >= rust_decimal::Decimal::from_str("3.0").unwrap() {
-                                            low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.015").unwrap())
+                                        if current_profit_pct >= rust_decimal::Decimal::from_str("1.5").unwrap() {
+                                            low * (rust_decimal::Decimal::ONE + rust_decimal::Decimal::from_str("0.008").unwrap())
                                         } else if current_profit_pct >= break_even_trigger {
                                             entry * (rust_decimal::Decimal::ONE - break_even_target / rust_decimal::Decimal::from_str("100").unwrap())
                                         } else {
