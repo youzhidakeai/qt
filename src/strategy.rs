@@ -280,12 +280,15 @@ impl StrategyEngine {
     pub async fn handle_trade(&mut self, trade: AggTradeUpdate) {
         use std::str::FromStr;
         let qty = rust_decimal::Decimal::from_str(&trade.qty).unwrap_or_default();
+        let price = rust_decimal::Decimal::from_str(&trade.price).unwrap_or_default();
+        let notional = qty * price;
+        
         if trade.is_buyer_maker {
-            self.fast_sell_flow += qty;
-            self.slow_sell_flow += qty;
+            self.fast_sell_flow += notional;
+            self.slow_sell_flow += notional;
         } else {
-            self.fast_buy_flow += qty;
-            self.slow_buy_flow += qty;
+            self.fast_buy_flow += notional;
+            self.slow_buy_flow += notional;
         }
     }
 
@@ -379,8 +382,9 @@ impl StrategyEngine {
                 }
 
                 if bid > local_high {
-                    let is_strong_fast = obi > dec!(0.3) && self.fast_buy_flow > self.fast_sell_flow * dec!(3.0);
-                    let is_strong_slow = self.slow_buy_flow > self.slow_sell_flow * dec!(1.5);
+                    let min_flow_threshold = dec!(15000.0); // 必须有绝对的资金体量爆发 (1.5万U/秒)
+                    let is_strong_fast = obi > dec!(0.3) && self.fast_buy_flow > self.fast_sell_flow * dec!(3.0) && self.fast_buy_flow > min_flow_threshold;
+                    let is_strong_slow = self.slow_buy_flow > self.slow_sell_flow * dec!(1.5) && self.slow_buy_flow > min_flow_threshold * dec!(2.0);
                     let is_strong = is_strong_fast && is_strong_slow;
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
@@ -397,8 +401,9 @@ impl StrategyEngine {
                         self.last_signal_time = Some(std::time::Instant::now());
                     }
                 } else if ask < local_low {
-                    let is_strong_fast = obi < dec!(-0.3) && self.fast_sell_flow > self.fast_buy_flow * dec!(3.0);
-                    let is_strong_slow = self.slow_sell_flow > self.slow_buy_flow * dec!(1.5);
+                    let min_flow_threshold = dec!(15000.0);
+                    let is_strong_fast = obi < dec!(-0.3) && self.fast_sell_flow > self.fast_buy_flow * dec!(3.0) && self.fast_sell_flow > min_flow_threshold;
+                    let is_strong_slow = self.slow_sell_flow > self.slow_buy_flow * dec!(1.5) && self.slow_sell_flow > min_flow_threshold * dec!(2.0);
                     let is_strong = is_strong_fast && is_strong_slow;
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
