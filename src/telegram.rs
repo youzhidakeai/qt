@@ -38,6 +38,10 @@ enum Command {
     Sub(String),
     #[command(description = "取消订阅币种并重启引擎。用法: /unsub DOGEUSDT")]
     Unsub(String),
+    #[command(description = "紧急暂停所有新开仓 (原有仓位止损继续生效)。用法: /pause")]
+    Pause,
+    #[command(description = "恢复自动开仓。用法: /resume")]
+    Resume,
 }
 
 pub async fn run_telegram_bot(
@@ -454,6 +458,19 @@ async fn answer(
                     std::process::exit(0);
                 }
             }
+        }
+
+        Command::Pause => {
+            for ctx in contexts.values() {
+                let _ = ctx.control_tx.send(ControlMessage::PauseTrading).await;
+            }
+            let _ = bot.send_message(msg.chat.id, "🛑 <b>已紧急暂停所有新开仓！</b>\n目前策略不会开任何新单，但已有的持仓依然会受到移动止损保护。").parse_mode(teloxide::types::ParseMode::Html).await;
+        }
+        Command::Resume => {
+            for ctx in contexts.values() {
+                let _ = ctx.control_tx.send(ControlMessage::ResumeTrading).await;
+            }
+            let _ = bot.send_message(msg.chat.id, "▶️ <b>自动开仓已恢复！</b>\n全自动高频狙击引擎已重新上线。").parse_mode(teloxide::types::ParseMode::Html).await;
         }
     }
     Ok(())

@@ -24,6 +24,8 @@ pub enum ControlMessage {
         amt: Decimal,
         entry: Decimal,
     },
+    PauseTrading,
+    ResumeTrading,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -94,6 +96,9 @@ pub struct StrategyEngine {
     // 日志计数器
     pub tick_counter: u64,
     
+    // 全局暂停标志位
+    pub trading_paused: bool,
+    
     pub signal_tx: mpsc::Sender<crate::portfolio::SignalEvent>,
     pub last_signal_time: Option<std::time::Instant>,
     pub current_funding_rate: Decimal,
@@ -145,6 +150,7 @@ impl StrategyEngine {
             tg_tx,
             feature_tx,
             tick_counter: 0,
+            trading_paused: false,
             signal_tx,
             last_signal_time: None,
             current_funding_rate: Decimal::ZERO,
@@ -279,6 +285,14 @@ impl StrategyEngine {
                     self.position.save_state(&self.redis_client).await;
                 }
             }
+            ControlMessage::PauseTrading => {
+                self.trading_paused = true;
+                info!("🛑 [{}] 已接收到指令，暂停开新仓。", self.position.symbol);
+            }
+            ControlMessage::ResumeTrading => {
+                self.trading_paused = false;
+                info!("▶️ [{}] 已接收到指令，恢复自动开仓。", self.position.symbol);
+            }
         }
     }
 
@@ -378,6 +392,10 @@ impl StrategyEngine {
             let mut state_changed = false;
 
             if self.position.position_amt.is_zero() {
+                if self.trading_paused {
+                    return;
+                }
+                
                 // ==========================================
                 // 全自动开仓 (实弹发射) 与 机器学习预测过滤
                 // ==========================================
