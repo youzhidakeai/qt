@@ -98,6 +98,7 @@ pub struct StrategyEngine {
     pub current_funding_rate: Decimal,
     pub last_funding_fetch: Option<std::time::Instant>,
     pub last_tick_time: Option<std::time::Instant>,
+    pub last_sl_error_time: Option<std::time::Instant>,
 }
 
 impl StrategyEngine {
@@ -146,6 +147,7 @@ impl StrategyEngine {
             current_funding_rate: Decimal::ZERO,
             last_funding_fetch: None,
             last_tick_time: None,
+            last_sl_error_time: None,
         }
     }
 
@@ -442,6 +444,9 @@ impl StrategyEngine {
                     }
 
                     if bid <= dynamic_sl_price {
+                        if let Some(t) = self.last_sl_error_time {
+                            if t.elapsed().as_secs() < 5 { return; }
+                        }
                         let gross_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100);
                         let net_pnl_pct = gross_pnl_pct - self.round_trip_fee_pct;
                         let gross_pnl_usdt = (bid - self.position.entry_price) * self.position.position_amt;
@@ -461,8 +466,11 @@ impl StrategyEngine {
                                 state_changed = true;
                             }
                             Err(e) => {
-                                error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
-                                let _ = self.tg_tx.send(format!("⚠️ <b>紧急警报：平多单 API 被拒！</b>\n交易对: {}\n请立即打开币安 APP 手动平仓！\n原因: {}", self.position.symbol, e)).await;
+                                if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
+                                    error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
+                                    let _ = self.tg_tx.send(format!("⚠️ <b>紧急警报：平多单 API 被拒！</b>\n交易对: {}\n请立即打开币安 APP 手动平仓！\n原因: {}\n系统将在 5 秒后重试...", self.position.symbol, e)).await;
+                                    self.last_sl_error_time = Some(std::time::Instant::now());
+                                }
                             }
                         }
                     }
@@ -483,6 +491,9 @@ impl StrategyEngine {
                     }
 
                     if ask >= dynamic_sl_price {
+                        if let Some(t) = self.last_sl_error_time {
+                            if t.elapsed().as_secs() < 5 { return; }
+                        }
                         let gross_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100);
                         let net_pnl_pct = gross_pnl_pct - self.round_trip_fee_pct;
 
@@ -503,8 +514,11 @@ impl StrategyEngine {
                                 state_changed = true;
                             }
                             Err(e) => {
-                                error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
-                                let _ = self.tg_tx.send(format!("⚠️ <b>紧急警报：平空单 API 被拒！</b>\n交易对: {}\n请立即打开币安 APP 手动平仓！\n原因: {}", self.position.symbol, e)).await;
+                                if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
+                                    error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
+                                    let _ = self.tg_tx.send(format!("⚠️ <b>紧急警报：平空单 API 被拒！</b>\n交易对: {}\n请立即打开币安 APP 手动平仓！\n原因: {}\n系统将在 5 秒后重试...", self.position.symbol, e)).await;
+                                    self.last_sl_error_time = Some(std::time::Instant::now());
+                                }
                             }
                         }
                     }

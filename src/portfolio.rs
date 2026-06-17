@@ -93,7 +93,7 @@ impl PortfolioManager {
         }
 
         let leverage = 10;
-        let target_margin = total_wallet * rust_decimal_macros::dec!(0.10);
+        let target_margin = total_wallet * rust_decimal_macros::dec!(0.30);
         
         let usable_margin = if avail_balance >= target_margin {
             target_margin
@@ -124,6 +124,7 @@ impl PortfolioManager {
 
         let qty_str = target_qty.normalize().to_string();
         let _ = self.exec_client.set_leverage(symbol, 10).await;
+        let _ = self.exec_client.set_margin_type(symbol, "ISOLATED").await;
         match self.exec_client.place_order(symbol, side, "MARKET", &qty_str, false).await {
             Ok(fill) => {
                 let actual_entry = if fill > Decimal::ZERO { fill } else { est_price };

@@ -170,6 +170,7 @@ async fn answer(
             if let Some(ctx) = contexts.get(&symbol) {
                 let lev_u32 = leverage.to_u32().unwrap_or(1);
                 let _ = exec_client.set_leverage(&symbol, lev_u32).await;
+                let _ = exec_client.set_margin_type(&symbol, "ISOLATED").await;
 
                 let estimated_entry = limit_price.unwrap_or_else(|| ctx.ob_manager.book.read().unwrap().asks.iter().next().map(|(p, _)| *p).unwrap_or(dec!(1)));
                 let notional = margin_usdt * leverage;
@@ -231,6 +232,7 @@ async fn answer(
             if let Some(ctx) = contexts.get(&symbol) {
                 let lev_u32 = leverage.to_u32().unwrap_or(1);
                 let _ = exec_client.set_leverage(&symbol, lev_u32).await;
+                let _ = exec_client.set_margin_type(&symbol, "ISOLATED").await;
 
                 let estimated_entry = limit_price.unwrap_or_else(|| ctx.ob_manager.book.read().unwrap().bids.iter().next_back().map(|(p, _)| *p).unwrap_or(dec!(1)));
                 let notional = margin_usdt * leverage;

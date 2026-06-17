@@ -63,6 +63,29 @@ impl BinanceExecutionClient {
         }
     }
 
+    pub async fn set_margin_type(&self, symbol: &str, margin_type: &str) -> Result<(), String> {
+        let endpoint = "/fapi/v1/marginType";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        
+        let payload = format!("symbol={}&marginType={}&recvWindow=60000&timestamp={}", symbol, margin_type, timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if status.is_success() || text.contains("-4046") {
+            Ok(())
+        } else {
+            Err(format!("设置保证金模式失败: {}", text))
+        }
+    }
+
     // 下单并返回真实的成交均价 (Fill Price)
     pub async fn place_order(
         &self,
