@@ -388,6 +388,9 @@ async fn main() {
                     }
                 }
             }
+            
+            // 强制休眠 60 秒，避免 0 点边界重复触发
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
 
