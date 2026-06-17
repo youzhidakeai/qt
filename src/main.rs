@@ -98,14 +98,28 @@ async fn main() {
     
     let redis_logger = redis_client.clone();
     tokio::spawn(async move {
-        if let Ok(mut con) = redis_logger.get_multiplexed_async_connection().await {
-            while let Some(json_str) = feature_rx.recv().await {
-                let _: () = redis::cmd("XADD")
-                    .arg("ML_FEATURE_STREAM")
-                    .arg("*")
-                    .arg("data")
-                    .arg(json_str)
-                    .query_async(&mut con).await.unwrap_or_default();
+        loop {
+            match redis_logger.get_multiplexed_async_connection().await {
+                Ok(mut con) => {
+                    tracing::info!("✅ Redis 特征流异步管道连接成功，等待数据...");
+                    while let Some(json_str) = feature_rx.recv().await {
+                        let res: Result<(), redis::RedisError> = redis::cmd("XADD")
+                            .arg("ML_FEATURE_STREAM")
+                            .arg("*")
+                            .arg("data")
+                            .arg(&json_str)
+                            .query_async(&mut con).await;
+                        
+                        if let Err(e) = res {
+                            tracing::error!("❌ 写入 Redis Stream 失败: {}", e);
+                            break; // 退出 while，触发重新连接
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("❌ Redis 管道连接失败，5秒后重试: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
             }
         }
     });
