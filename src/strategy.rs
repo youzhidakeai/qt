@@ -467,8 +467,13 @@ impl StrategyEngine {
                         state_changed = true;
                     }
                     let current_profit_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100);
+                    let break_even_trigger_pct = dec!(1.0);
+                    let break_even_target_pct = self.round_trip_fee_pct + dec!(0.05);
+
                     let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.highest_price_since_entry * (dec!(1) - self.trailing_sl_pct / dec!(100))
+                    } else if current_profit_pct >= break_even_trigger_pct {
+                        self.position.entry_price * (dec!(1) + break_even_target_pct / dec!(100))
                     } else {
                         // 扣除双边手续费，确保硬止损的净亏损不超过 initial_sl_pct
                         let effective_sl_pct = self.initial_sl_pct - self.round_trip_fee_pct;
@@ -517,8 +522,13 @@ impl StrategyEngine {
                         state_changed = true;
                     }
                     let current_profit_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100);
+                    let break_even_trigger_pct = dec!(1.0);
+                    let break_even_target_pct = self.round_trip_fee_pct + dec!(0.05);
+
                     let dynamic_sl_price = if current_profit_pct >= self.activation_pct {
                         self.position.lowest_price_since_entry * (dec!(1) + self.trailing_sl_pct / dec!(100))
+                    } else if current_profit_pct >= break_even_trigger_pct {
+                        self.position.entry_price * (dec!(1) - break_even_target_pct / dec!(100))
                     } else {
                         // 扣除双边手续费，确保硬止损的净亏损不超过 initial_sl_pct
                         let effective_sl_pct = self.initial_sl_pct - self.round_trip_fee_pct;
