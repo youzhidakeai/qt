@@ -127,8 +127,8 @@ impl StrategyEngine {
             exec_client,
             ob_manager,
             redis_client,
-            mid_price_history: VecDeque::with_capacity(300),
-            breakout_window: 300,
+            mid_price_history: VecDeque::with_capacity(3000),
+            breakout_window: 3000,
             initial_sl_pct: dec!(2.5),
             activation_pct: dec!(3.0),
             trailing_sl_pct: dec!(1.5),
@@ -389,7 +389,7 @@ impl StrategyEngine {
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
-                    if ml_prob > dec!(0.6) {
+                    if is_strong || ml_prob > dec!(0.75) {
                         info!("🚀 [{}] 触发做多信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
                         
                         let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
@@ -408,7 +408,7 @@ impl StrategyEngine {
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "SELL", &self.mid_price_history);
-                    if ml_prob > dec!(0.6) {
+                    if is_strong || ml_prob > dec!(0.75) {
                         info!("💥 [{}] 触发做空信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
 
                         let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
@@ -437,12 +437,8 @@ impl StrategyEngine {
                     };
 
                     if current_profit_pct < self.activation_pct {
-                        if let Some(thick_bid) = self.ob_manager.get_thickest_wall(true, 10) {
-                            let wall_sl = thick_bid * dec!(0.9995); 
-                            if wall_sl > dynamic_sl_price && wall_sl < self.position.entry_price {
-                                dynamic_sl_price = wall_sl;
-                            }
-                        }
+                        // 已移除假墙 (Spoofing) 止损机制，避免被做市商的虚假厚盘口骗出局。
+                        // 统一依赖入场均价的 initial_sl_pct 进行硬止损。
                     }
 
                     if bid <= dynamic_sl_price {
@@ -483,12 +479,7 @@ impl StrategyEngine {
                     };
 
                     if current_profit_pct < self.activation_pct {
-                        if let Some(thick_ask) = self.ob_manager.get_thickest_wall(false, 10) {
-                            let wall_sl = thick_ask * dec!(1.0005);
-                            if wall_sl < dynamic_sl_price && wall_sl > self.position.entry_price {
-                                dynamic_sl_price = wall_sl;
-                            }
-                        }
+                        // 已移除假墙 (Spoofing) 止损机制，避免被做市商的虚假厚盘口骗出局。
                     }
 
                     if ask >= dynamic_sl_price {

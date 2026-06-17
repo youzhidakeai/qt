@@ -21,6 +21,8 @@ pub struct PortfolioManager {
     signal_rx: mpsc::Receiver<SignalEvent>,
     tg_tx: mpsc::Sender<String>,
     exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
+    active_symbols: std::collections::HashSet<String>,
+    redis_client: redis::Client,
 }
 
 impl PortfolioManager {
@@ -30,8 +32,9 @@ impl PortfolioManager {
         signal_rx: mpsc::Receiver<SignalEvent>,
         tg_tx: mpsc::Sender<String>,
         exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
+        redis_client: redis::Client,
     ) -> Self {
-        Self { exec_client, control_senders, signal_rx, tg_tx, exchange_info }
+        Self { exec_client, control_senders, signal_rx, tg_tx, exchange_info, active_symbols: std::collections::HashSet::new(), redis_client }
     }
 
     pub async fn run(mut self) {
@@ -61,26 +64,31 @@ impl PortfolioManager {
         let pos_str = self.exec_client.check_positions().await.unwrap_or_default();
         let positions: Vec<serde_json::Value> = serde_json::from_str(&pos_str).unwrap_or_default();
         
-        let mut active_count = 0;
-        let mut has_existing_pos = false;
+        self.active_symbols.clear();
         for pos in &positions {
             let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
             if amt.abs() > rust_decimal::Decimal::ZERO {
-                active_count += 1;
                 let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                if sym == signal.symbol {
-                    has_existing_pos = true;
-                }
+                self.active_symbols.insert(sym.to_string());
             }
         }
 
-        if has_existing_pos {
+        if self.active_symbols.contains(&signal.symbol) {
             info!("⚠️ [中央大脑] {} 已经持有仓位，拒绝重复开仓。", signal.symbol);
             return;
         }
 
-        if active_count >= 3 {
-            info!("⚠️ [中央大脑] 当前已持有 {} 个仓位，达到系统并发上限 (3)，拒绝新信号 {}。", active_count, signal.symbol);
+        let mut max_positions: usize = 3; // 默认上限
+        if let Ok(mut con) = self.redis_client.get_multiplexed_async_connection().await {
+            if let Ok(val) = redis::cmd("GET").arg("MAX_CONCURRENT_POSITIONS").query_async::<String>(&mut con).await {
+                if let Ok(parsed) = val.parse::<usize>() {
+                    max_positions = parsed;
+                }
+            }
+        }
+
+        if self.active_symbols.len() >= max_positions {
+            info!("⚠️ [中央大脑] 当前已持有 {} 个仓位，达到系统并发上限 ({})，拒绝新信号 {}。", self.active_symbols.len(), max_positions, signal.symbol);
             return;
         }
 
@@ -99,6 +107,8 @@ impl PortfolioManager {
         }
 
         let notional = usable_margin * Decimal::from(leverage);
+        
+        self.active_symbols.insert(signal.symbol.clone()); // 乐观锁占位，防止网络延迟造成高并发突破持仓上限
         self.execute_trade(&signal.symbol, &signal.side, notional, signal.price).await;
     }
 

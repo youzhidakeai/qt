@@ -176,8 +176,9 @@ async fn main() {
     let portfolio_tg = tg_tx.clone();
     let portfolio_exchange = exchange_info.clone();
     let control_senders_clone = control_senders.clone();
+    let portfolio_redis = redis_client.clone();
     tokio::spawn(async move {
-        let pm = portfolio::PortfolioManager::new(portfolio_exec, control_senders_clone, signal_rx, portfolio_tg, portfolio_exchange);
+        let pm = portfolio::PortfolioManager::new(portfolio_exec, control_senders_clone, signal_rx, portfolio_tg, portfolio_exchange, portfolio_redis);
         pm.run().await;
     });
 
