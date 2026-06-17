@@ -249,7 +249,14 @@ async fn main() {
         let mut last_prices: std::collections::HashMap<String, Decimal> = std::collections::HashMap::new();
         loop {
             interval.tick().await;
-            let mut report = String::from("⏱️ <b>[行情 5 分钟雷达扫瞄]</b>\n\n");
+            let mut report = String::from("⏱️ <b>[行情 5 分钟雷达扫瞄]</b>\n");
+            let mut coins_report = String::new();
+            
+            let mut up_count = 0;
+            let mut down_count = 0;
+            let mut total_pct = rust_decimal::Decimal::ZERO;
+            let mut valid_coins = 0;
+
             let mut sym_keys: Vec<&String> = tg_ctx_ticker.keys().collect();
             sym_keys.sort(); // 保持固定的字母顺序
             
@@ -331,21 +338,48 @@ async fn main() {
                             let pct = (price - *last_p) / *last_p * rust_decimal_macros::dec!(100);
                             if pct > Decimal::ZERO {
                                 delta_str = format!(" (📈 +{:.3}%)", pct);
+                                up_count += 1;
                             } else if pct < Decimal::ZERO {
                                 delta_str = format!(" (📉 {:.3}%)", pct);
+                                down_count += 1;
                             } else {
                                 delta_str = format!(" (➖ 0.000%)");
                             }
+                            total_pct += pct;
+                            valid_coins += 1;
                         }
                     }
                     if price > Decimal::ZERO {
                         last_prices.insert((*sym).clone(), price);
-                        report.push_str(&format!("🔹 <b>{}</b>: {}{}{}\n", sym, price, delta_str, extra_info));
+                        coins_report.push_str(&format!("🔹 <b>{}</b>: {}{}{}\n", sym, price, delta_str, extra_info));
                     } else {
-                        report.push_str(&format!("🔹 <b>{}</b>: 数据获取中...\n", sym));
+                        coins_report.push_str(&format!("🔹 <b>{}</b>: 数据获取中...\n", sym));
                     }
                 }
             }
+            
+            if valid_coins > 0 {
+                let avg_pct = total_pct / rust_decimal::Decimal::from(valid_coins);
+                let sentiment = if avg_pct > rust_decimal_macros::dec!(0.3) {
+                    "🔥 市场狂热 (全线拉升)"
+                } else if avg_pct > rust_decimal_macros::dec!(0.1) && up_count > down_count {
+                    "📈 偏向乐观 (缓慢上涨)"
+                } else if avg_pct < rust_decimal_macros::dec!(-0.3) {
+                    "🩸 市场恐慌 (全线暴跌)"
+                } else if avg_pct < rust_decimal_macros::dec!(-0.1) && down_count > up_count {
+                    "📉 偏向悲观 (震荡阴跌)"
+                } else {
+                    "⚖️ 震荡洗盘 (多空焦灼)"
+                };
+                
+                report.push_str(&format!("📊 <b>大盘情绪:</b> {}\n", sentiment));
+                report.push_str(&format!("⏱️ <b>5分钟均幅:</b> {:.3}%\n", avg_pct));
+                report.push_str(&format!("🟢 上涨: {} 只 | 🔴 下跌: {} 只\n\n", up_count, down_count));
+            } else {
+                report.push_str("\n");
+            }
+            report.push_str(&coins_report);
+            
             let _ = tg_tx_ticker.send(report).await;
         }
     });
