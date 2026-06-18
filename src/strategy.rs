@@ -26,6 +26,7 @@ pub enum ControlMessage {
     },
     PauseTrading,
     ResumeTrading,
+    AllowShorting(bool),
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -98,6 +99,7 @@ pub struct StrategyEngine {
     
     // 全局暂停标志位
     pub trading_paused: bool,
+    pub allow_shorting: bool,
     
     pub signal_tx: mpsc::Sender<crate::portfolio::SignalEvent>,
     pub last_signal_time: Option<std::time::Instant>,
@@ -151,6 +153,7 @@ impl StrategyEngine {
             feature_tx,
             tick_counter: 0,
             trading_paused: false,
+            allow_shorting: false, // 默认关闭做空，防止牛市受损
             signal_tx,
             last_signal_time: None,
             current_funding_rate: Decimal::ZERO,
@@ -293,6 +296,10 @@ impl StrategyEngine {
                 self.trading_paused = false;
                 info!("▶️ [{}] 已接收到指令，恢复自动开仓。", self.position.symbol);
             }
+            ControlMessage::AllowShorting(allow) => {
+                self.allow_shorting = allow;
+                info!("⚙️ [{}] 自动做空开关设置为: {}", self.position.symbol, allow);
+            }
         }
     }
 
@@ -434,10 +441,11 @@ impl StrategyEngine {
                         }).await;
                         self.last_signal_time = Some(std::time::Instant::now());
                     }
-                } else if ask < local_low {
+                } else if ask < local_low && self.allow_shorting {
                     let min_flow_threshold = dec!(15000.0);
-                    let is_strong_fast = obi < dec!(-0.3) && self.fast_sell_flow > self.fast_buy_flow * dec!(3.0) && self.fast_sell_flow > min_flow_threshold;
-                    let is_strong_slow = self.slow_sell_flow > self.slow_buy_flow * dec!(1.5) && self.slow_sell_flow > min_flow_threshold * dec!(2.0);
+                    // 地狱级做空难度：极度恐慌的订单簿失衡，且瞬间砸盘资金必须是买盘的 10 倍以上
+                    let is_strong_fast = obi < dec!(-0.6) && self.fast_sell_flow > self.fast_buy_flow * dec!(10.0) && self.fast_sell_flow > min_flow_threshold * dec!(2.0);
+                    let is_strong_slow = self.slow_sell_flow > self.slow_buy_flow * dec!(3.0) && self.slow_sell_flow > min_flow_threshold * dec!(3.0);
                     let is_strong = is_strong_fast && is_strong_slow;
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };

@@ -38,10 +38,12 @@ enum Command {
     Sub(String),
     #[command(description = "取消订阅币种并重启引擎。用法: /unsub DOGEUSDT")]
     Unsub(String),
-    #[command(description = "紧急暂停所有新开仓 (原有仓位止损继续生效)。用法: /pause")]
+    #[command(description = "暂停自动开新仓。用法: /pause")]
     Pause,
     #[command(description = "恢复自动开仓。用法: /resume")]
     Resume,
+    #[command(description = "做空机制开关。用法: /short on 或 /short off")]
+    Short(String),
 }
 
 pub async fn run_telegram_bot(
@@ -470,7 +472,23 @@ async fn answer(
             for ctx in contexts.values() {
                 let _ = ctx.control_tx.send(ControlMessage::ResumeTrading).await;
             }
-            let _ = bot.send_message(msg.chat.id, "▶️ <b>自动开仓已恢复！</b>\n全自动高频狙击引擎已重新上线。").parse_mode(teloxide::types::ParseMode::Html).await;
+            bot.send_message(msg.chat.id, "▶️ <b>自动交易已恢复！</b>\n策略引擎全功率运转，将正常捕捉所有交易信号。").parse_mode(teloxide::types::ParseMode::Html).await?;
+        }
+        Command::Short(args) => {
+            let arg = args.trim().to_lowercase();
+            if arg == "on" {
+                for ctx in contexts.values() {
+                    let _ = ctx.control_tx.send(ControlMessage::AllowShorting(true)).await;
+                }
+                bot.send_message(msg.chat.id, "📉 <b>自动做空已开启！</b>\n目前仅当触发【地狱级砸盘】条件（砸盘资金超买盘 10 倍）时，才会允许做空。").parse_mode(teloxide::types::ParseMode::Html).await?;
+            } else if arg == "off" {
+                for ctx in contexts.values() {
+                    let _ = ctx.control_tx.send(ControlMessage::AllowShorting(false)).await;
+                }
+                bot.send_message(msg.chat.id, "🚫 <b>自动做空已彻底关闭！</b>\n策略引擎现已切换为纯多头（Long-Only）模式，只抓暴涨，不再做空。").parse_mode(teloxide::types::ParseMode::Html).await?;
+            } else {
+                bot.send_message(msg.chat.id, "❌ 参数错误。用法: /short on 或 /short off").await?;
+            }
         }
     }
     Ok(())
