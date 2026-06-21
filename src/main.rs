@@ -89,7 +89,14 @@ async fn main() {
         }
         let _: () = pipe.query_async(&mut redis_con).await.unwrap_or_default();
     }
-    
+    // 强制确保三大盘向标在订阅列表中，为大盘熔断器提供数据源
+    for required_sym in ["BTCUSDT", "ETHUSDT", "BNBUSDT"] {
+        if !symbols.contains(&required_sym.to_string()) {
+            symbols.push(required_sym.to_string());
+            let _: () = redis::cmd("SADD").arg("SUBSCRIBED_SYMBOLS").arg(required_sym).query_async(&mut redis_con).await.unwrap_or_default();
+        }
+    }
+
     info!("🔥 锁定当前监控名单 (共 {} 个): {:?}", symbols.len(), symbols);
     let mut tg_contexts = HashMap::new();
     let mut control_senders = HashMap::new();
