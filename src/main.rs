@@ -241,39 +241,59 @@ async fn main() {
     let circuit_tg = tg_tx.clone();
     let circuit_ctx = tg_ctx_arc.clone();
     tokio::spawn(async move {
-        let mut btc_history: std::collections::VecDeque<rust_decimal::Decimal> = std::collections::VecDeque::new();
+        let mut histories: std::collections::HashMap<&str, std::collections::VecDeque<rust_decimal::Decimal>> = std::collections::HashMap::new();
+        histories.insert("BTCUSDT", std::collections::VecDeque::new());
+        histories.insert("ETHUSDT", std::collections::VecDeque::new());
+        histories.insert("BNBUSDT", std::collections::VecDeque::new());
+        
         let mut panic_mode = false;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            if let Some(btc_ctx) = circuit_ctx.get("BTCUSDT") {
-                let current_price = {
-                    let ob = btc_ctx.ob_manager.book.read().unwrap();
-                    ob.bids.iter().next_back().map(|(p, _)| *p).unwrap_or(rust_decimal::Decimal::ZERO)
-                };
-                if current_price > rust_decimal::Decimal::ZERO {
-                    btc_history.push_back(current_price);
-                    if btc_history.len() > 15 {
-                        btc_history.pop_front();
-                    }
-                    
-                    let max_price = btc_history.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&current_price);
-                    let drop_pct = (current_price - *max_price) / *max_price * rust_decimal_macros::dec!(100);
-                    
-                    if drop_pct <= rust_decimal_macros::dec!(-1.2) { // 15分钟内回撤超1.2%视为血洗
-                        if !panic_mode {
-                            panic_mode = true;
-                            let _ = circuit_tg.send("🚨 <b>大盘熔断警报</b> 🚨\n比特币在过去 15 分钟内暴跌超 1.2%！系统已自动启动最高级别防御：\n⛔️ <b>强制暂停所有多单开仓</b>\n(已有仓位的移动止损继续生效)".to_string()).await;
-                            for ctx in circuit_ctx.values() {
-                                let _ = ctx.control_tx.send(crate::strategy::ControlMessage::PauseTrading).await;
-                            }
+            
+            let mut min_drop_pct = rust_decimal_macros::dec!(0.0);
+            let mut trigger_symbol = "";
+            let mut all_recovered = true;
+
+            for sym in ["BTCUSDT", "ETHUSDT", "BNBUSDT"] {
+                if let Some(ctx) = circuit_ctx.get(sym) {
+                    let current_price = {
+                        let ob = ctx.ob_manager.book.read().unwrap();
+                        ob.bids.iter().next_back().map(|(p, _)| *p).unwrap_or(rust_decimal::Decimal::ZERO)
+                    };
+                    if current_price > rust_decimal::Decimal::ZERO {
+                        let history = histories.get_mut(sym).unwrap();
+                        history.push_back(current_price);
+                        if history.len() > 15 {
+                            history.pop_front();
                         }
-                    } else if drop_pct >= rust_decimal_macros::dec!(-0.4) && panic_mode {
-                        panic_mode = false;
-                        let _ = circuit_tg.send("🌤 <b>大盘企稳警报</b>\n比特币跌幅已收窄或开始横盘整理！大盘熔断解除：\n▶️ <b>全自动狙击引擎重新点火，恢复开仓</b>".to_string()).await;
-                        for ctx in circuit_ctx.values() {
-                            let _ = ctx.control_tx.send(crate::strategy::ControlMessage::ResumeTrading).await;
+                        
+                        let max_price = history.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&current_price);
+                        let drop_pct = (current_price - *max_price) / *max_price * rust_decimal_macros::dec!(100);
+                        
+                        if drop_pct < min_drop_pct {
+                            min_drop_pct = drop_pct;
+                            trigger_symbol = sym;
+                        }
+                        if drop_pct < rust_decimal_macros::dec!(-0.4) {
+                            all_recovered = false;
                         }
                     }
+                }
+            }
+            
+            if min_drop_pct <= rust_decimal_macros::dec!(-1.2) { // 任一巨头 15分钟内回撤超1.2%视为血洗
+                if !panic_mode {
+                    panic_mode = true;
+                    let _ = circuit_tg.send(format!("🚨 <b>大盘熔断警报</b> 🚨\n领跌巨头 {} 在过去 15 分钟内暴跌 {}%！系统已自动启动最高级别防御：\n⛔️ <b>强制暂停所有多单开仓</b>\n(已有仓位的移动止损继续生效)", trigger_symbol.replace("USDT", ""), min_drop_pct.round_dp(2))).await;
+                    for ctx in circuit_ctx.values() {
+                        let _ = ctx.control_tx.send(crate::strategy::ControlMessage::PauseTrading).await;
+                    }
+                }
+            } else if all_recovered && panic_mode {
+                panic_mode = false;
+                let _ = circuit_tg.send("🌤 <b>大盘企稳警报</b>\nBTC/ETH/BNB 三巨头跌幅均已收窄或横盘！大盘熔断解除：\n▶️ <b>全自动狙击引擎重新点火，恢复开仓</b>".to_string()).await;
+                for ctx in circuit_ctx.values() {
+                    let _ = ctx.control_tx.send(crate::strategy::ControlMessage::ResumeTrading).await;
                 }
             }
         }
