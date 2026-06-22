@@ -508,9 +508,8 @@ impl StrategyEngine {
                         let gross_pnl_usdt = (bid - self.position.entry_price) * self.position.position_amt;
                         let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * bid) * dec!(0.0005);
                         let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
-                        self.record_trade_history("LONG", bid, gross_pnl_usdt, fee_usdt, net_pnl_usdt).await;
                         
-                        info!("🏁 [{}] 多单触及止损线！但已彻底关闭自动平仓功能，仅通知！", self.position.symbol);
+                        info!("🏁 [{}] 多单触及止损线！但已彻底关闭自动平仓功能，仅通知！(当前浮盈: {:.2} U)", self.position.symbol, net_pnl_usdt);
                         
                         /*
                         let qty_str = self.position.position_amt.abs().normalize().to_string();
@@ -568,7 +567,6 @@ impl StrategyEngine {
                         let gross_pnl_usdt = (self.position.entry_price - ask) * self.position.position_amt.abs();
                         let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * ask) * dec!(0.0005);
                         let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
-                        self.record_trade_history("SHORT", ask, gross_pnl_usdt, fee_usdt, net_pnl_usdt).await;
                         
                         info!("🏁 [{}] 空单触及止损线！但已彻底关闭自动平仓功能，仅通知！", self.position.symbol);
                         
