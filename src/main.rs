@@ -662,6 +662,8 @@ async fn run_auto_rotator(redis_client: redis::Client, exec_client: Arc<BinanceE
                     for t in tickers {
                         let sym = t["symbol"].as_str().unwrap_or("");
                         if !sym.ends_with("USDT") || sym.contains("_") { continue; }
+                        // 过滤掉黄金和白银等非加密资产 (它们的盘口由传统金融做市商控制，容易产生突破假信号)
+                        if sym.starts_with("XAU") || sym.starts_with("XAG") { continue; }
 
                         let pct_change = t["priceChangePercent"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
                         let vol = t["quoteVolume"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
