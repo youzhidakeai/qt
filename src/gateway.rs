@@ -8,7 +8,7 @@ use crate::models::{DepthUpdate, AggTradeUpdate};
 
 pub async fn run_binance_ws(symbol: &str, tx: mpsc::Sender<DepthUpdate>) {
     let base_ws = std::env::var("BINANCE_WS_URL").unwrap_or_else(|_| "wss://fstream.binance.com/ws".to_string());
-    let ws_url = format!("{}/{}@depth@100ms", base_ws, symbol.to_lowercase());
+    let ws_url = format!("{}/{}@depth5@100ms", base_ws, symbol.to_lowercase());
     let mut retry_delay = 1;
 
     loop {

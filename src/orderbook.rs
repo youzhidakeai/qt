@@ -27,13 +27,13 @@ impl OrderBookManager {
 
     pub fn apply_update(&self, bids: &[[String; 2]], asks: &[[String; 2]]) {
         let mut book = self.book.write().expect("RwLock poisoned");
+        book.bids.clear();
+        book.asks.clear();
 
         for b in bids {
             let price = Decimal::from_str(&b[0]).unwrap_or_default();
             let qty = Decimal::from_str(&b[1]).unwrap_or_default();
-            if qty.is_zero() {
-                book.bids.remove(&price);
-            } else {
+            if !qty.is_zero() {
                 book.bids.insert(price, qty);
             }
         }
@@ -41,9 +41,7 @@ impl OrderBookManager {
         for a in asks {
             let price = Decimal::from_str(&a[0]).unwrap_or_default();
             let qty = Decimal::from_str(&a[1]).unwrap_or_default();
-            if qty.is_zero() {
-                book.asks.remove(&price);
-            } else {
+            if !qty.is_zero() {
                 book.asks.insert(price, qty);
             }
         }
