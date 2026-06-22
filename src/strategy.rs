@@ -274,6 +274,7 @@ impl StrategyEngine {
                         self.position.position_amt = Decimal::ZERO;
                         info!("🔄 [{}] 发现仓位归零 (可能被强平/手动平仓)，已自愈更新。", self.position.symbol);
                     } else {
+                        let was_zero = self.position.position_amt == Decimal::ZERO;
                         self.position.position_amt = amt;
                         self.position.entry_price = entry;
                         // Reset highest/lowest to current price to restart trailing SL safely
@@ -281,8 +282,13 @@ impl StrategyEngine {
                             let ob = self.ob_manager.book.read().unwrap();
                             ob.bids.iter().next_back().map(|(p, _)| *p).unwrap_or(entry)
                         };
-                        self.position.highest_price_since_entry = if self.position.highest_price_since_entry < current_price { current_price } else { self.position.highest_price_since_entry };
-                        self.position.lowest_price_since_entry = if self.position.lowest_price_since_entry > current_price { current_price } else { self.position.lowest_price_since_entry };
+                        if was_zero {
+                            self.position.highest_price_since_entry = current_price;
+                            self.position.lowest_price_since_entry = current_price;
+                        } else {
+                            self.position.highest_price_since_entry = if self.position.highest_price_since_entry < current_price { current_price } else { self.position.highest_price_since_entry };
+                            self.position.lowest_price_since_entry = if self.position.lowest_price_since_entry > current_price { current_price } else { self.position.lowest_price_since_entry };
+                        }
                         info!("🔄 [{}] 发现仓位变化 (部分成交或手工修改)，已自愈更新。量: {}, 均价: {}", self.position.symbol, amt, entry);
                     }
                     self.position.save_state(&self.redis_client).await;
