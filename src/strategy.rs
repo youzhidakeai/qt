@@ -510,8 +510,9 @@ impl StrategyEngine {
                         let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
                         self.record_trade_history("LONG", bid, gross_pnl_usdt, fee_usdt, net_pnl_usdt).await;
                         
-                        info!("🏁 [{}] 多单离场信号！正在向交易所发送市价卖出（平多）指令...", self.position.symbol);
+                        info!("🏁 [{}] 多单触及止损线！但已彻底关闭自动平仓功能，仅通知！", self.position.symbol);
                         
+                        /*
                         let qty_str = self.position.position_amt.abs().normalize().to_string();
                         match self.exec_client.place_order(&self.position.symbol, "SELL", "MARKET", &qty_str, true).await {
                             Ok(_) => {
@@ -532,6 +533,7 @@ impl StrategyEngine {
                                 }
                             }
                         }
+                        */
                     }
                 } else if self.position.position_amt < Decimal::ZERO { 
                     if ask < self.position.lowest_price_since_entry {
@@ -568,8 +570,9 @@ impl StrategyEngine {
                         let net_pnl_usdt = gross_pnl_usdt - fee_usdt;
                         self.record_trade_history("SHORT", ask, gross_pnl_usdt, fee_usdt, net_pnl_usdt).await;
                         
-                        info!("🏁 [{}] 空单离场信号！正在向交易所发送市价买入（平空）指令...", self.position.symbol);
+                        info!("🏁 [{}] 空单触及止损线！但已彻底关闭自动平仓功能，仅通知！", self.position.symbol);
                         
+                        /*
                         let qty_str = self.position.position_amt.abs().normalize().to_string();
                         match self.exec_client.place_order(&self.position.symbol, "BUY", "MARKET", &qty_str, true).await {
                             Ok(_) => {
@@ -590,6 +593,7 @@ impl StrategyEngine {
                                 }
                             }
                         }
+                        */
                     }
                 }
             }
