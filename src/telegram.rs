@@ -403,6 +403,7 @@ async fn answer(
                                 let unpnl_str = pos.get("unRealizedProfit").and_then(|v| v.as_str()).unwrap_or("0");
                                 let unpnl: f64 = unpnl_str.parse().unwrap_or(0.0);
                                 let entry = pos.get("entryPrice").and_then(|v| v.as_str()).unwrap_or("0");
+                                let mark_price = pos.get("markPrice").and_then(|v| v.as_str()).unwrap_or("0");
                                 
                                 total_unpnl += unpnl;
                                 
@@ -411,8 +412,9 @@ async fn answer(
                                     "<b>{}</b> {}\n\
                                      🔹 持仓量: {}\n\
                                      🔹 开仓价: {}\n\
+                                     🔹 当前现价: {}\n\
                                      💵 未实现盈亏: <b>{} USDT</b>\n\n",
-                                     symbol, direction, amt_str, entry, unpnl_str
+                                     symbol, direction, amt_str, entry, mark_price, unpnl_str
                                 ));
                             }
                         }
