@@ -30,6 +30,8 @@ enum Command {
     Status,
     #[command(description = "查看当前所有持仓与未实现收益")]
     Pnl,
+    #[command(description = "查看特定时间段内的真实已实现收益。用法: /profit 10m, /profit 2h, /profit 1d, /profit 1w")]
+    Profit(String),
     #[command(description = "获取当前所有订阅币种的实时盘口价和涨跌幅。用法: /price [时间维度]，例如: /price 15m, /price 1h, /price 24h")]
     Price(String),
     #[command(description = "生成昨日盈亏与交易手续费总结")]
@@ -427,6 +429,82 @@ async fn answer(
                     }
                 }
                 Err(e) => { bot.send_message(msg.chat.id, format!("⚠️ API 获取持仓失败：\n{}", e)).parse_mode(teloxide::types::ParseMode::Html).await?; }
+            }
+        }
+        Command::Profit(args) => {
+            let arg = args.trim().to_lowercase();
+            if arg.is_empty() {
+                bot.send_message(msg.chat.id, "❌ 错误: 参数为空。\n用法: /profit 10m (分钟), 2h (小时), 1d (天), 1w (周)").await?;
+                return Ok(());
+            }
+            
+            let duration_secs = if arg.ends_with('m') {
+                arg.replace('m', "").parse::<u64>().unwrap_or(0) * 60
+            } else if arg.ends_with('h') {
+                arg.replace('h', "").parse::<u64>().unwrap_or(0) * 3600
+            } else if arg.ends_with('d') {
+                arg.replace('d', "").parse::<u64>().unwrap_or(0) * 86400
+            } else if arg.ends_with('w') {
+                arg.replace('w', "").parse::<u64>().unwrap_or(0) * 86400 * 7
+            } else {
+                bot.send_message(msg.chat.id, "❌ 时间格式错误。\n支持的单位: m(分钟), h(小时), d(天), w(周)").await?;
+                return Ok(());
+            };
+            
+            if duration_secs == 0 || duration_secs > 86400 * 30 {
+                bot.send_message(msg.chat.id, "❌ 时间无效或跨度过大 (最大支持30天以内的小跨度查询)。").await?;
+                return Ok(());
+            }
+
+            bot.send_message(msg.chat.id, format!("⏳ 正在向币安总账核算过去 {} 的真实已实现收益...", arg)).await?;
+
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            let start_ms = now_ms - (duration_secs * 1000);
+            
+            match exec_client.get_income_history(start_ms, now_ms).await {
+                Ok(income_str) => {
+                    if let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&income_str) {
+                        let mut total_pnl = 0.0;
+                        let mut total_fee = 0.0;
+                        let mut total_funding = 0.0;
+                        let mut trades_count = 0;
+                        
+                        for r in records {
+                            let income_type = r["incomeType"].as_str().unwrap_or("");
+                            let income = r["income"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+                            
+                            if income_type == "REALIZED_PNL" {
+                                total_pnl += income;
+                                trades_count += 1;
+                            } else if income_type == "COMMISSION" {
+                                total_fee += income;
+                            } else if income_type == "FUNDING_FEE" {
+                                total_funding += income;
+                            }
+                        }
+                        
+                        let net_profit = total_pnl + total_fee + total_funding;
+                        let emoji = if net_profit > 0.0 { "🤑" } else { "🩸" };
+                        
+                        let report = format!(
+                            "{} <b>过去 {} 收益报告</b>\n\n\
+                             🔹 <b>总实现盈亏</b>: {:.4} USDT\n\
+                             🔹 <b>交易手续费</b>: {:.4} USDT\n\
+                             🔹 <b>资金费率</b>: {:.4} USDT\n\
+                             ----------------------------\n\
+                             💰 <b>最终净利润</b>: <b>{:.4} USDT</b>\n\
+                             (涵盖 {} 笔盈亏流水记录)",
+                             emoji, arg, total_pnl, total_fee, total_funding, net_profit, trades_count
+                        );
+                        bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
+                    } else {
+                        bot.send_message(msg.chat.id, "⚠️ 解析币安收益数据失败。可能是查询跨度超出币安单次查询限制。").await?;
+                    }
+                }
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("⚠️ 拉取收益数据失败：{}", e)).await?;
+                }
             }
         }
         Command::Sub(args) => {
