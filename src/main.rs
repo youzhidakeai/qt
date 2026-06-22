@@ -574,8 +574,21 @@ async fn main() {
     info!("🚀 所有 {} 个交易节点就绪，进入无穷循环待命...", symbols.len());
     let _ = tg_tx.send(format!("🟢 矩阵引擎系统启动完毕！\n\n已成功挂载 {} 个交易对的 WebSocket 流动性监听网络。\n全自动微秒级突破狙击（带吃单流验证）已准备就绪，随时开火。", symbols.len())).await;
     
+    // ==========================================
+    // MODULE: 全自动 AI 盘感引擎任务
+    // ==========================================
+    let rotator_redis = redis_client.clone();
+    let rotator_exec = exec_client.clone();
+    let rotator_tg = tg_tx.clone();
+    tokio::spawn(async move {
+        // 延迟 5 分钟后再启动首次扫描，防止刚开机就重启
+        tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+        run_auto_rotator(rotator_redis, rotator_exec, rotator_tg).await;
+    });
+
+    info!("矩阵核心系统正在运行中 (Matrix Engine Core Running)... 按 Ctrl+C 终止");
     tokio::signal::ctrl_c().await.unwrap();
-    info!("系统正在关闭...");
+    info!("接收到关闭信号，优雅停机...");
 }
 
 // 从币安主网 (Mainnet) 拉取真实成交额最高的合约币种，从而避开测试网上产生的那些诸如 JELLYJELLY 的垃圾假币
@@ -605,6 +618,101 @@ async fn fetch_top_symbols(limit: usize) -> Vec<String> {
     }
     // 如果获取失败，返回保底币种
     vec!["BTCUSDT".to_string(), "ETHUSDT".to_string(), "BNBUSDT".to_string(), "DOGEUSDT".to_string()]
+}
+
+// ==========================================
+// MODULE: 全自动 AI 盘感引擎 (动态添币 / 淘汰劣质币)
+// ==========================================
+async fn run_auto_rotator(redis_client: redis::Client, exec_client: Arc<BinanceExecutionClient>, tg_tx: mpsc::Sender<String>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // 每小时执行一次
+    loop {
+        interval.tick().await;
+
+        let mut con = match redis_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let current_subs: std::collections::HashSet<String> = redis::cmd("SMEMBERS").arg("SUBSCRIBED_SYMBOLS").query_async(&mut con).await.unwrap_or_default();
+        let mut active_positions = std::collections::HashSet::new();
+
+        if let Ok(pos_str) = exec_client.check_positions().await {
+            if let Ok(positions) = serde_json::from_str::<Vec<serde_json::Value>>(&pos_str) {
+                for pos in positions {
+                    let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+                    if amt != rust_decimal::Decimal::ZERO {
+                        if let Some(sym) = pos.get("symbol").and_then(|v| v.as_str()) {
+                            active_positions.insert(sym.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let url = "https://fapi.binance.com/fapi/v1/ticker/24hr";
+        let http_client = reqwest::Client::new();
+        if let Ok(resp) = http_client.get(url).send().await {
+            if let Ok(text) = resp.text().await {
+                if let Ok(tickers) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                    let mut to_add = Vec::new();
+                    let mut to_remove = Vec::new();
+
+                    let core_symbols = vec!["BTCUSDT", "ETHUSDT", "BNBUSDT"];
+
+                    for t in tickers {
+                        let sym = t["symbol"].as_str().unwrap_or("");
+                        if !sym.ends_with("USDT") || sym.contains("_") { continue; }
+
+                        let pct_change = t["priceChangePercent"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+                        let vol = t["quoteVolume"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+
+                        // 加入涨幅离谱的币 (涨幅 > 15% 且成交额 > 5000万)
+                        if pct_change > 15.0 && vol > 50_000_000.0 {
+                            if !current_subs.contains(sym) {
+                                to_add.push(sym.to_string());
+                            }
+                        }
+
+                        // 淘汰跌幅离谱的币 (跌幅 < -5% 或者是死水)
+                        if pct_change < -5.0 && current_subs.contains(sym) {
+                            if !core_symbols.contains(&sym) && !active_positions.contains(sym) {
+                                to_remove.push(sym.to_string());
+                            }
+                        }
+                    }
+
+                    if !to_add.is_empty() || !to_remove.is_empty() {
+                        let mut msg = String::from("🔄 <b>AI 动态调仓警报</b> 🔄\n\n");
+                        
+                        let mut pipe = redis::pipe();
+                        if !to_add.is_empty() {
+                            msg.push_str("🚀 <b>捕获到强势暴涨币 (加入狙击池):</b>\n");
+                            for s in &to_add {
+                                pipe.cmd("SADD").arg("SUBSCRIBED_SYMBOLS").arg(s);
+                                msg.push_str(&format!(" ➕ {}\n", s));
+                            }
+                            msg.push_str("\n");
+                        }
+                        if !to_remove.is_empty() {
+                            msg.push_str("🗑 <b>剔除暴跌/死水劣质币 (保护内存):</b>\n");
+                            for s in &to_remove {
+                                pipe.cmd("SREM").arg("SUBSCRIBED_SYMBOLS").arg(s);
+                                msg.push_str(&format!(" ➖ {}\n", s));
+                            }
+                            msg.push_str("\n");
+                        }
+                        
+                        let _: () = pipe.query_async(&mut con).await.unwrap_or_default();
+                        msg.push_str("⚠️ 正在重启底层交易引擎以生效新的数据管线...");
+                        
+                        let _ = tg_tx.send(msg).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ==========================================
