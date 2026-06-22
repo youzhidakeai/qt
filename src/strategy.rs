@@ -132,6 +132,10 @@ impl StrategyEngine {
             }
         };
 
+        let mut redis_conn = redis_client.get_async_connection().await.unwrap();
+        let pause_key = format!("strategy_paused_{}", symbol);
+        let trading_paused: bool = redis::cmd("GET").arg(&pause_key).query_async(&mut redis_conn).await.unwrap_or(false);
+
         Self {
             position,
             exec_client,
@@ -152,7 +156,7 @@ impl StrategyEngine {
             tg_tx,
             feature_tx,
             tick_counter: 0,
-            trading_paused: false,
+            trading_paused,
             allow_shorting: false, // 默认关闭做空，防止牛市受损
             signal_tx,
             last_signal_time: None,
@@ -296,11 +300,15 @@ impl StrategyEngine {
             }
             ControlMessage::PauseTrading => {
                 self.trading_paused = true;
-                info!("🛑 [{}] 已接收到指令，暂停开新仓。", self.position.symbol);
+                let mut conn = self.redis_client.get_async_connection().await.unwrap();
+                let _: () = redis::cmd("SET").arg(format!("strategy_paused_{}", self.position.symbol)).arg(1).query_async(&mut conn).await.unwrap_or(());
+                info!("🛑 [{}] 已接收到指令，暂停开新仓并保存至 Redis。", self.position.symbol);
             }
             ControlMessage::ResumeTrading => {
                 self.trading_paused = false;
-                info!("▶️ [{}] 已接收到指令，恢复自动开仓。", self.position.symbol);
+                let mut conn = self.redis_client.get_async_connection().await.unwrap();
+                let _: () = redis::cmd("SET").arg(format!("strategy_paused_{}", self.position.symbol)).arg(0).query_async(&mut conn).await.unwrap_or(());
+                info!("▶️ [{}] 已接收到指令，恢复全自动交易并保存至 Redis。", self.position.symbol);
             }
             ControlMessage::AllowShorting(allow) => {
                 self.allow_shorting = allow;
