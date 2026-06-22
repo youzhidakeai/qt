@@ -513,6 +513,9 @@ impl StrategyEngine {
                                 let emoji = if net_pnl_pct > Decimal::ZERO { "🏆" } else { "🔪" };
                                 let _ = self.tg_tx.send(format!("{} 移动止损平多战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}% ({} U)\n💸 手续费: -{}% ({} U)\n💰 净盈亏: {}% ({} U)", emoji, self.position.symbol, bid, gross_pnl_pct.round_dp(3), gross_pnl_usdt.round_dp(3), self.round_trip_fee_pct.round_dp(3), fee_usdt.round_dp(3), net_pnl_pct.round_dp(3), net_pnl_usdt.round_dp(3))).await;
                                 self.position.position_amt = Decimal::ZERO;
+                                self.position.entry_price = Decimal::ZERO;
+                                self.position.highest_price_since_entry = Decimal::ZERO;
+                                self.position.lowest_price_since_entry = Decimal::ZERO;
                                 state_changed = true;
                             }
                             Err(e) => {
@@ -568,6 +571,9 @@ impl StrategyEngine {
                                 let emoji = if net_pnl_pct > Decimal::ZERO { "🏆" } else { "🔪" };
                                 let _ = self.tg_tx.send(format!("{} 移动止损平空战报\n\n交易对: {}\n离场均价: {}\n📈 毛盈亏: {}% ({} U)\n💸 手续费: -{}% ({} U)\n💰 净盈亏: {}% ({} U)", emoji, self.position.symbol, ask, gross_pnl_pct.round_dp(3), gross_pnl_usdt.round_dp(3), self.round_trip_fee_pct.round_dp(3), fee_usdt.round_dp(3), net_pnl_pct.round_dp(3), net_pnl_usdt.round_dp(3))).await;
                                 self.position.position_amt = Decimal::ZERO;
+                                self.position.entry_price = Decimal::ZERO;
+                                self.position.highest_price_since_entry = Decimal::ZERO;
+                                self.position.lowest_price_since_entry = Decimal::ZERO;
                                 state_changed = true;
                             }
                             Err(e) => {
