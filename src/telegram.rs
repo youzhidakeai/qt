@@ -407,7 +407,12 @@ async fn answer(
                                 
                                 total_unpnl += unpnl;
                                 
-                                let direction = if amt > 0.0 { "🟢 多头 (LONG)" } else { "🔴 空头 (SHORT)" };
+                                let entry_num: f64 = entry.parse().unwrap_or(0.0);
+                                let notional = amt.abs() * entry_num;
+                                let estimated_fee = notional * 0.001; // 估算 0.1% 的双边摩擦成本
+                                let safe_tag = if unpnl > estimated_fee && unpnl > 0.0 { " 🛡️ [已覆盖手续费, 保本无忧]" } else { "" };
+                                
+                                let direction = if amt > 0.0 { format!("🟢 多头 (LONG){}", safe_tag) } else { format!("🔴 空头 (SHORT){}", safe_tag) };
                                 pnl_text.push_str(&format!(
                                     "<b>{}</b> {}\n\
                                      🔹 持仓量: {}\n\
