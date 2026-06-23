@@ -433,19 +433,20 @@ impl StrategyEngine {
                     }
                 }
 
-                if bid > local_high {
-                    let min_flow_threshold = dec!(15000.0); // 必须有绝对的资金体量爆发 (1.5万U/秒)
-                    let is_strong_fast = obi > dec!(0.3) && self.fast_buy_flow > self.fast_sell_flow * dec!(3.0) && self.fast_buy_flow > min_flow_threshold;
-                    let is_strong_slow = self.slow_buy_flow > self.slow_sell_flow * dec!(1.5) && self.slow_buy_flow > min_flow_threshold * dec!(2.0);
+                // 阶梯建仓与右侧买入逻辑 (买跌不买涨)
+                // 1. 价格必须从局部低点反弹 (右侧企稳)
+                // 2. 价格不能在天花板 (避免追高)
+                if bid > local_low * dec!(1.002) && bid < local_high * dec!(0.99) {
+                    let min_flow_threshold = dec!(10000.0); // 资金体量爆发
+                    let is_strong_fast = obi > dec!(0.2) && self.fast_buy_flow > self.fast_sell_flow * dec!(2.0) && self.fast_buy_flow > min_flow_threshold;
+                    let is_strong_slow = self.slow_buy_flow > self.slow_sell_flow * dec!(1.5) && self.slow_buy_flow > min_flow_threshold * dec!(1.5);
                     let is_strong = is_strong_fast && is_strong_slow;
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
                     
-
-
                     if is_strong || ml_prob > dec!(0.75) {
-                        info!("🚀 [{}] 触发做多信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
+                        info!("🚀 [{}] 触发回调接多信号！级别: {} | AI 胜率: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
                         
                         let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
                             symbol: self.position.symbol.clone(),
@@ -481,7 +482,40 @@ impl StrategyEngine {
                 }
             } else {
                 // ==========================================
-                // 全自动平仓 (追踪止损实弹平仓)
+                // 1. 马丁格尔阶梯补仓逻辑 (DCA)
+                // ==========================================
+                if self.position.position_amt > Decimal::ZERO && !self.trading_paused {
+                    let draw_down_pct = (self.position.entry_price - bid) / self.position.entry_price * dec!(100);
+                    let notional = self.position.position_amt.abs() * self.position.entry_price;
+                    let single_shot_notional = self.auto_margin_usdt * rust_decimal::Decimal::from(self.auto_leverage);
+                    
+                    // 估算当前补仓次数 (根据持仓总额和单次开仓额度)
+                    let dca_count = (notional / single_shot_notional).floor();
+                    
+                    // 阶梯差价触发条件 (例如跌 3% 补第一枪，再跌 4% 补第二枪)
+                    let target_drawdown = if dca_count == dec!(1) { dec!(3.0) } else if dca_count == dec!(2) { dec!(7.0) } else { dec!(99.0) };
+                    
+                    if draw_down_pct > target_drawdown && dca_count < dec!(3) {
+                        let should_dca = if let Some(t) = self.last_signal_time {
+                            t.elapsed() > std::time::Duration::from_secs(60) // 防止连续高频补仓
+                        } else { true };
+                        
+                        // 且必须有右侧止跌反弹迹象才补仓
+                        if should_dca && bid > local_low * dec!(1.002) {
+                            info!("🛡️ [{}] 触发智能阶梯补仓 (DCA)！当前回撤: {}%，第 {} 次补仓", self.position.symbol, draw_down_pct.round_dp(2), dca_count);
+                            let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
+                                symbol: self.position.symbol.clone(),
+                                side: "BUY".to_string(), // 补多
+                                price: bid,
+                                strength: "DCA".to_string(),
+                            }).await;
+                            self.last_signal_time = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                
+                // ==========================================
+                // 2. 全自动平仓 (追踪止损实弹平仓)
                 // ==========================================
                 if self.position.position_amt > Decimal::ZERO { 
                     if bid > self.position.highest_price_since_entry {
