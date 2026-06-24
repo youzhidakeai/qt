@@ -38,6 +38,7 @@ pub struct PositionManager {
     pub entry_price: Decimal,
     pub highest_price_since_entry: Decimal,
     pub lowest_price_since_entry: Decimal,
+    pub dca_count: u8,
 }
 
 impl PositionManager {
@@ -129,6 +130,7 @@ impl StrategyEngine {
                 entry_price: Decimal::ZERO,
                 highest_price_since_entry: Decimal::ZERO,
                 lowest_price_since_entry: dec!(999999999),
+                dca_count: 0,
             }
         };
 
@@ -202,6 +204,7 @@ impl StrategyEngine {
             }
             ControlMessage::ClearPosition => {
                 self.position.position_amt = Decimal::ZERO;
+                self.position.dca_count = 0;
                 self.position.save_state(&self.redis_client).await;
             }
             ControlMessage::ClosePosition => {
@@ -216,6 +219,7 @@ impl StrategyEngine {
                 match res {
                     Ok(_) => {
                         self.position.position_amt = Decimal::ZERO;
+                        self.position.dca_count = 0;
                         self.position.save_state(&self.redis_client).await;
                         let _ = self.tg_tx.send(format!("✅ [{}] 一键手动平仓成功！仓位已清零。", self.position.symbol)).await;
                     }
@@ -261,6 +265,7 @@ impl StrategyEngine {
                             let _ = self.tg_tx.send(format!("✅ [{}] 手动仓位接管成功！\n持仓量: {}\n开仓均价: {}\n已挂载移动止损保护，当前监测基准价: {}", self.position.symbol, amt, entry, current_price)).await;
                         } else {
                             self.position.position_amt = rust_decimal::Decimal::ZERO;
+                            self.position.dca_count = 0;
                             self.position.save_state(&self.redis_client).await;
                             let _ = self.tg_tx.send(format!("⚠️ [{}] 币安 APP 上当前没有持仓。大脑记忆已同步清零。", self.position.symbol)).await;
                         }
@@ -486,23 +491,22 @@ impl StrategyEngine {
                 // ==========================================
                 if self.position.position_amt > Decimal::ZERO && !self.trading_paused {
                     let draw_down_pct = (self.position.entry_price - bid) / self.position.entry_price * dec!(100);
-                    let notional = self.position.position_amt.abs() * self.position.entry_price;
-                    let single_shot_notional = self.auto_margin_usdt * rust_decimal::Decimal::from(self.auto_leverage);
                     
-                    // 估算当前补仓次数 (根据持仓总额和单次开仓额度)
-                    let dca_count = (notional / single_shot_notional).floor();
+                    let dca_count = self.position.dca_count;
                     
-                    // 阶梯差价触发条件 (例如跌 3% 补第一枪，再跌 4% 补第二枪)
-                    let target_drawdown = if dca_count == dec!(1) { dec!(3.0) } else if dca_count == dec!(2) { dec!(7.0) } else { dec!(99.0) };
+                    // 阶梯差价触发条件 (例如跌 3% 补第一枪，再跌 7% 补第二枪)
+                    let target_drawdown = if dca_count == 0 { dec!(3.0) } else if dca_count == 1 { dec!(7.0) } else { dec!(99.0) };
                     
-                    if draw_down_pct > target_drawdown && dca_count < dec!(3) {
+                    if draw_down_pct > target_drawdown && dca_count < 2 {
                         let should_dca = if let Some(t) = self.last_signal_time {
                             t.elapsed() > std::time::Duration::from_secs(60) // 防止连续高频补仓
                         } else { true };
                         
                         // 且必须有右侧止跌反弹迹象才补仓
                         if should_dca && bid > local_low * dec!(1.002) {
-                            info!("🛡️ [{}] 触发智能阶梯补仓 (DCA)！当前回撤: {}%，第 {} 次补仓", self.position.symbol, draw_down_pct.round_dp(2), dca_count);
+                            info!("🛡️ [{}] 触发智能阶梯补仓 (DCA)！当前回撤: {}%，这是第 {} 次补仓", self.position.symbol, draw_down_pct.round_dp(2), dca_count + 1);
+                            self.position.dca_count += 1;
+                            self.position.save_state(&self.redis_client).await;
                             let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
                                 symbol: self.position.symbol.clone(),
                                 side: "BUY".to_string(), // 补多
@@ -544,6 +548,7 @@ impl StrategyEngine {
                                         self.position.entry_price = Decimal::ZERO;
                                         self.position.highest_price_since_entry = Decimal::ZERO;
                                         self.position.lowest_price_since_entry = Decimal::ZERO;
+                                        self.position.dca_count = 0;
                                         self.position.save_state(&self.redis_client).await;
                                         state_changed = true;
                                     }
@@ -610,6 +615,34 @@ impl StrategyEngine {
                         */
                     }
                 } else if self.position.position_amt < Decimal::ZERO { 
+                    // ==========================================
+                    // 空单马丁格尔阶梯补仓逻辑 (DCA)
+                    // ==========================================
+                    if !self.trading_paused {
+                        let draw_down_pct = (ask - self.position.entry_price) / self.position.entry_price * dec!(100);
+                        let dca_count = self.position.dca_count;
+                        
+                        let target_drawdown = if dca_count == 0 { dec!(3.0) } else if dca_count == 1 { dec!(7.0) } else { dec!(99.0) };
+                        
+                        if draw_down_pct > target_drawdown && dca_count < 2 {
+                            let should_dca = if let Some(t) = self.last_signal_time {
+                                t.elapsed() > std::time::Duration::from_secs(60)
+                            } else { true };
+                            
+                            if should_dca && ask < local_high * dec!(0.998) {
+                                info!("🛡️ [{}] 触发智能阶梯补空 (DCA)！当前回撤: {}%，这是第 {} 次补仓", self.position.symbol, draw_down_pct.round_dp(2), dca_count + 1);
+                                self.position.dca_count += 1;
+                                self.position.save_state(&self.redis_client).await;
+                                let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
+                                    symbol: self.position.symbol.clone(),
+                                    side: "SELL".to_string(),
+                                    price: ask,
+                                    strength: "DCA".to_string(),
+                                }).await;
+                                self.last_signal_time = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
                     if ask < self.position.lowest_price_since_entry {
                         self.position.lowest_price_since_entry = ask;
                         state_changed = true;
@@ -636,6 +669,7 @@ impl StrategyEngine {
                                         self.position.entry_price = Decimal::ZERO;
                                         self.position.highest_price_since_entry = Decimal::ZERO;
                                         self.position.lowest_price_since_entry = Decimal::ZERO;
+                                        self.position.dca_count = 0;
                                         self.position.save_state(&self.redis_client).await;
                                         state_changed = true;
                                     }
