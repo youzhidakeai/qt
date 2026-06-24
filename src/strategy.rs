@@ -122,7 +122,12 @@ impl StrategyEngine {
         feature_tx: mpsc::Sender<String>,
     ) -> Self {
         let position = match PositionManager::load_state(symbol, &redis_client).await {
-            Some(pm) => pm,
+            Some(mut pm) => {
+                if pm.position_amt == Decimal::ZERO {
+                    pm.dca_count = 0;
+                }
+                pm
+            },
             None => PositionManager {
                 symbol: symbol.to_string(),
                 is_isolated: true,
@@ -281,6 +286,10 @@ impl StrategyEngine {
                 if amt != self.position.position_amt {
                     if amt == Decimal::ZERO {
                         self.position.position_amt = Decimal::ZERO;
+                        self.position.entry_price = Decimal::ZERO;
+                        self.position.highest_price_since_entry = Decimal::ZERO;
+                        self.position.lowest_price_since_entry = Decimal::ZERO;
+                        self.position.dca_count = 0;
                         info!("🔄 [{}] 发现仓位归零 (可能被强平/手动平仓)，已自愈更新。", self.position.symbol);
                     } else {
                         let was_zero = self.position.position_amt == Decimal::ZERO;
