@@ -115,7 +115,7 @@ impl PortfolioManager {
             }
         }
 
-        if self.active_symbols.len() >= max_positions {
+        if self.active_symbols.len() >= max_positions && !self.active_symbols.contains(&signal.symbol) {
             info!("⚠️ [中央大脑] 当前已持有 {} 个仓位，达到系统并发上限 ({})，拒绝新信号 {}。", self.active_symbols.len(), max_positions, signal.symbol);
             return;
         }
