@@ -23,6 +23,7 @@ pub struct PortfolioManager {
     exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
     active_symbols: std::collections::HashSet<String>,
     redis_client: redis::Client,
+    last_new_position_time: Option<std::time::Instant>,
 }
 
 impl PortfolioManager {
@@ -34,7 +35,7 @@ impl PortfolioManager {
         exchange_info: Arc<HashMap<String, crate::execution::SymbolInfo>>,
         redis_client: redis::Client,
     ) -> Self {
-        Self { exec_client, control_senders, signal_rx, tg_tx, exchange_info, active_symbols: std::collections::HashSet::new(), redis_client }
+        Self { exec_client, control_senders, signal_rx, tg_tx, exchange_info, active_symbols: std::collections::HashSet::new(), redis_client, last_new_position_time: None }
     }
 
     pub async fn run(mut self) {
@@ -74,8 +75,20 @@ impl PortfolioManager {
         }
 
         if self.active_symbols.contains(&signal.symbol) {
-            info!("⚠️ [中央大脑] {} 已经持有仓位，拒绝重复开仓。", signal.symbol);
-            return;
+            if signal.strength != "DCA" {
+                info!("⚠️ [中央大脑] {} 已经持有仓位，拒绝重复开仓。", signal.symbol);
+                return;
+            } else {
+                info!("🛡️ [中央大脑] 允许 {} 执行马丁格尔阶梯补仓！", signal.symbol);
+            }
+        } else {
+            // 如果是全新开仓，检查高并发锁
+            if let Some(t) = self.last_new_position_time {
+                if t.elapsed() < std::time::Duration::from_secs(2) {
+                    info!("⏳ [中央大脑] 正在等待上一个订单的交易所状态同步，拒绝高并发秒开新币种: {}", signal.symbol);
+                    return;
+                }
+            }
         }
 
         let mut max_positions: usize = 3; // 默认上限
@@ -108,7 +121,10 @@ impl PortfolioManager {
 
         let notional = usable_margin * Decimal::from(leverage);
         
-        self.active_symbols.insert(signal.symbol.clone()); // 乐观锁占位，防止网络延迟造成高并发突破持仓上限
+        if !self.active_symbols.contains(&signal.symbol) {
+            self.active_symbols.insert(signal.symbol.clone()); // 乐观锁占位，防止网络延迟造成高并发突破持仓上限
+            self.last_new_position_time = Some(std::time::Instant::now());
+        }
         self.execute_trade(&signal.symbol, &signal.side, notional, signal.price).await;
     }
 
