@@ -518,36 +518,42 @@ impl StrategyEngine {
                 // 2. 全自动平仓 (追踪止损实弹平仓)
                 // ==========================================
                 if self.position.position_amt > Decimal::ZERO { 
-                    // --- 10% 止盈收网逻辑 ---
-                    let current_net_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
-                    if current_net_pnl_pct >= dec!(10.0) && !self.trading_paused {
-                        if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
-                            let qty_str = self.position.position_amt.abs().normalize().to_string();
-                            info!("🎯 [{}] 达到 10% 止盈目标！执行平多操作！(净盈亏: {:.2}%)", self.position.symbol, current_net_pnl_pct);
-                            match self.exec_client.place_order(&self.position.symbol, "SELL", "MARKET", &qty_str, true).await {
-                                Ok(_) => {
-                                    let gross_usdt = (bid - self.position.entry_price) * self.position.position_amt;
-                                    let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * bid) * dec!(0.0005);
-                                    let net_usdt = gross_usdt - fee_usdt;
-                                    let _ = self.tg_tx.send(format!("🏆 <b>【完美止盈收网】</b>\n\n交易对: {}\n离场均价: {}\n📈 净盈亏: +{}% (赚 {} U)", self.position.symbol, bid, current_net_pnl_pct.round_dp(2), net_usdt.round_dp(2))).await;
-                                    self.position.position_amt = Decimal::ZERO;
-                                    self.position.entry_price = Decimal::ZERO;
-                                    self.position.highest_price_since_entry = Decimal::ZERO;
-                                    self.position.lowest_price_since_entry = Decimal::ZERO;
-                                    self.position.save_state(&self.redis_client).await;
-                                    state_changed = true;
-                                }
-                                Err(e) => {
-                                    error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
-                                    self.last_sl_error_time = Some(std::time::Instant::now());
-                                }
-                            }
-                        }
-                    }
-
                     if bid > self.position.highest_price_since_entry {
                         self.position.highest_price_since_entry = bid;
                         state_changed = true;
+                    }
+
+                    // --- 动态追踪止盈收网逻辑 (Trailing Take Profit) ---
+                    let max_net_pnl_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                    if max_net_pnl_pct >= dec!(10.0) && !self.trading_paused {
+                        let trailing_drawdown_pct = dec!(4.0); // 宽容型回撤
+                        let trailing_tp_price = self.position.highest_price_since_entry * (dec!(1.0) - trailing_drawdown_pct / dec!(100));
+                        
+                        if bid <= trailing_tp_price {
+                            if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
+                                let current_net_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                                let qty_str = self.position.position_amt.abs().normalize().to_string();
+                                info!("🎯 [{}] 触发追踪止盈！最高点回撤达 {}%，执行平多！(最终净盈亏: {:.2}%)", self.position.symbol, trailing_drawdown_pct, current_net_pnl_pct);
+                                match self.exec_client.place_order(&self.position.symbol, "SELL", "MARKET", &qty_str, true).await {
+                                    Ok(_) => {
+                                        let gross_usdt = (bid - self.position.entry_price) * self.position.position_amt;
+                                        let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * bid) * dec!(0.0005);
+                                        let net_usdt = gross_usdt - fee_usdt;
+                                        let _ = self.tg_tx.send(format!("🏆 <b>【动态追踪止盈收网】</b>\n\n交易对: {}\n离场均价: {}\n📈 净盈亏: +{}% (赚 {} U)", self.position.symbol, bid, current_net_pnl_pct.round_dp(2), net_usdt.round_dp(2))).await;
+                                        self.position.position_amt = Decimal::ZERO;
+                                        self.position.entry_price = Decimal::ZERO;
+                                        self.position.highest_price_since_entry = Decimal::ZERO;
+                                        self.position.lowest_price_since_entry = Decimal::ZERO;
+                                        self.position.save_state(&self.redis_client).await;
+                                        state_changed = true;
+                                    }
+                                    Err(e) => {
+                                        error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
+                                        self.last_sl_error_time = Some(std::time::Instant::now());
+                                    }
+                                }
+                            }
+                        }
                     }
                     let current_profit_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100);
                     let break_even_trigger_pct = dec!(1.0);
@@ -604,36 +610,42 @@ impl StrategyEngine {
                         */
                     }
                 } else if self.position.position_amt < Decimal::ZERO { 
-                    // --- 10% 止盈收网逻辑 (空单) ---
-                    let current_net_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
-                    if current_net_pnl_pct >= dec!(10.0) && !self.trading_paused {
-                        if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
-                            let qty_str = self.position.position_amt.abs().normalize().to_string();
-                            info!("🎯 [{}] 达到 10% 止盈目标！执行平空操作！(净盈亏: {:.2}%)", self.position.symbol, current_net_pnl_pct);
-                            match self.exec_client.place_order(&self.position.symbol, "BUY", "MARKET", &qty_str, true).await {
-                                Ok(_) => {
-                                    let gross_usdt = (self.position.entry_price - ask) * self.position.position_amt.abs();
-                                    let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * ask) * dec!(0.0005);
-                                    let net_usdt = gross_usdt - fee_usdt;
-                                    let _ = self.tg_tx.send(format!("🏆 <b>【完美止盈收网】</b>\n\n交易对: {}\n离场均价: {}\n📈 净盈亏: +{}% (赚 {} U)", self.position.symbol, ask, current_net_pnl_pct.round_dp(2), net_usdt.round_dp(2))).await;
-                                    self.position.position_amt = Decimal::ZERO;
-                                    self.position.entry_price = Decimal::ZERO;
-                                    self.position.highest_price_since_entry = Decimal::ZERO;
-                                    self.position.lowest_price_since_entry = Decimal::ZERO;
-                                    self.position.save_state(&self.redis_client).await;
-                                    state_changed = true;
-                                }
-                                Err(e) => {
-                                    error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
-                                    self.last_sl_error_time = Some(std::time::Instant::now());
-                                }
-                            }
-                        }
-                    }
-
                     if ask < self.position.lowest_price_since_entry {
                         self.position.lowest_price_since_entry = ask;
                         state_changed = true;
+                    }
+
+                    // --- 动态追踪止盈收网逻辑 (空单) ---
+                    let max_net_pnl_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                    if max_net_pnl_pct >= dec!(10.0) && !self.trading_paused {
+                        let trailing_drawdown_pct = dec!(4.0); // 宽容型回撤
+                        let trailing_tp_price = self.position.lowest_price_since_entry * (dec!(1.0) + trailing_drawdown_pct / dec!(100));
+                        
+                        if ask >= trailing_tp_price {
+                            if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
+                                let current_net_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                                let qty_str = self.position.position_amt.abs().normalize().to_string();
+                                info!("🎯 [{}] 触发追踪止盈！最高点回撤达 {}%，执行平空！(最终净盈亏: {:.2}%)", self.position.symbol, trailing_drawdown_pct, current_net_pnl_pct);
+                                match self.exec_client.place_order(&self.position.symbol, "BUY", "MARKET", &qty_str, true).await {
+                                    Ok(_) => {
+                                        let gross_usdt = (self.position.entry_price - ask) * self.position.position_amt.abs();
+                                        let fee_usdt = (self.position.position_amt.abs() * self.position.entry_price + self.position.position_amt.abs() * ask) * dec!(0.0005);
+                                        let net_usdt = gross_usdt - fee_usdt;
+                                        let _ = self.tg_tx.send(format!("🏆 <b>【动态追踪止盈收网】</b>\n\n交易对: {}\n离场均价: {}\n📈 净盈亏: +{}% (赚 {} U)", self.position.symbol, ask, current_net_pnl_pct.round_dp(2), net_usdt.round_dp(2))).await;
+                                        self.position.position_amt = Decimal::ZERO;
+                                        self.position.entry_price = Decimal::ZERO;
+                                        self.position.highest_price_since_entry = Decimal::ZERO;
+                                        self.position.lowest_price_since_entry = Decimal::ZERO;
+                                        self.position.save_state(&self.redis_client).await;
+                                        state_changed = true;
+                                    }
+                                    Err(e) => {
+                                        error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
+                                        self.last_sl_error_time = Some(std::time::Instant::now());
+                                    }
+                                }
+                            }
+                        }
                     }
                     let current_profit_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100);
                     let break_even_trigger_pct = dec!(1.0);
