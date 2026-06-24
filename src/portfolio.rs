@@ -91,12 +91,27 @@ impl PortfolioManager {
             }
         }
 
-        let mut max_positions: usize = 3; // 默认上限
-        if let Ok(mut con) = self.redis_client.get_multiplexed_async_connection().await {
-            if let Ok(val) = redis::cmd("GET").arg("MAX_CONCURRENT_POSITIONS").query_async::<String>(&mut con).await {
-                if let Ok(parsed) = val.parse::<usize>() {
-                    max_positions = parsed;
+        let mut max_positions: usize = 1; // 默认上限改为 1 (最保守策略)
+        match self.redis_client.get_multiplexed_async_connection().await {
+            Ok(mut con) => {
+                match redis::cmd("GET").arg("MAX_CONCURRENT_POSITIONS").query_async::<Option<String>>(&mut con).await {
+                    Ok(Some(val)) => {
+                        if let Ok(parsed) = val.parse::<usize>() {
+                            max_positions = parsed;
+                        } else {
+                            error!("Redis 中 MAX_CONCURRENT_POSITIONS 值不是有效数字: {}", val);
+                        }
+                    }
+                    Ok(None) => {
+                        // Key 不存在
+                    }
+                    Err(e) => {
+                        error!("查询 Redis MAX_CONCURRENT_POSITIONS 失败: {}", e);
+                    }
                 }
+            }
+            Err(e) => {
+                error!("无法获取 Redis 异步连接: {}", e);
             }
         }
 
