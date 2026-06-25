@@ -553,8 +553,12 @@ impl StrategyEngine {
                         let trailing_tp_price = self.position.highest_price_since_entry * (dec!(1.0) - trailing_drawdown_pct / dec!(100));
                         
                         if bid <= trailing_tp_price {
-                            if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
-                                let current_net_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                            let current_net_pnl_pct = (bid - self.position.entry_price) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                            if current_net_pnl_pct < Decimal::ZERO {
+                                info!("⚠️ [{}] 追踪止盈拦截: 引擎刚恢复，发现早已跌破止盈线且当前已亏损 ({:.2}%)！拒绝以止盈名义割肉，重置高点。", self.position.symbol, current_net_pnl_pct);
+                                self.position.highest_price_since_entry = bid;
+                                self.position.save_state(&self.redis_client).await;
+                            } else if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
                                 let qty_str = self.position.position_amt.abs().normalize().to_string();
                                 info!("🎯 [{}] 触发追踪止盈！最高点回撤达 {}%，执行平多！(最终净盈亏: {:.2}%)", self.position.symbol, trailing_drawdown_pct, current_net_pnl_pct);
                                 match self.exec_client.place_order(&self.position.symbol, "SELL", "MARKET", &qty_str, true).await {
@@ -569,7 +573,6 @@ impl StrategyEngine {
                                         self.position.lowest_price_since_entry = Decimal::ZERO;
                                         self.position.dca_count = 0;
                                         self.position.save_state(&self.redis_client).await;
-                                        state_changed = true;
                                     }
                                     Err(e) => {
                                         error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
@@ -673,8 +676,12 @@ impl StrategyEngine {
                         let trailing_tp_price = self.position.lowest_price_since_entry * (dec!(1.0) + trailing_drawdown_pct / dec!(100));
                         
                         if ask >= trailing_tp_price {
-                            if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
-                                let current_net_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                            let current_net_pnl_pct = (self.position.entry_price - ask) / self.position.entry_price * dec!(100) - self.round_trip_fee_pct;
+                            if current_net_pnl_pct < Decimal::ZERO {
+                                info!("⚠️ [{}] 追踪止盈拦截: 引擎刚恢复，发现早已突破止盈线且当前已亏损 ({:.2}%)！拒绝以止盈名义割肉，重置低点。", self.position.symbol, current_net_pnl_pct);
+                                self.position.lowest_price_since_entry = ask;
+                                self.position.save_state(&self.redis_client).await;
+                            } else if self.last_sl_error_time.map_or(true, |t| t.elapsed().as_secs() >= 5) {
                                 let qty_str = self.position.position_amt.abs().normalize().to_string();
                                 info!("🎯 [{}] 触发追踪止盈！最高点回撤达 {}%，执行平空！(最终净盈亏: {:.2}%)", self.position.symbol, trailing_drawdown_pct, current_net_pnl_pct);
                                 match self.exec_client.place_order(&self.position.symbol, "BUY", "MARKET", &qty_str, true).await {
@@ -689,7 +696,6 @@ impl StrategyEngine {
                                         self.position.lowest_price_since_entry = Decimal::ZERO;
                                         self.position.dca_count = 0;
                                         self.position.save_state(&self.redis_client).await;
-                                        state_changed = true;
                                     }
                                     Err(e) => {
                                         error!("❌ [{}] API平仓失败: {}", self.position.symbol, e);
