@@ -195,7 +195,13 @@ impl StrategyEngine {
                     self.position.position_amt = new_qty;
                     self.position.highest_price_since_entry = self.position.entry_price;
                     self.position.lowest_price_since_entry = self.position.entry_price;
-                    info!("🎯 [{}] 补仓/建仓成功！总仓位: {}，新均价: {}", self.position.symbol, new_qty, self.position.entry_price);
+                    
+                    if current_qty != Decimal::ZERO {
+                        self.position.dca_count += 1;
+                        info!("🎯 [{}] 补仓成功！当前 DCA 次数: {}，总仓位: {}，新均价: {}", self.position.symbol, self.position.dca_count, new_qty, self.position.entry_price);
+                    } else {
+                        info!("🎯 [{}] 建仓成功！总仓位: {}，新均价: {}", self.position.symbol, new_qty, self.position.entry_price);
+                    }
                 } else if new_qty.is_sign_positive() != current_qty.is_sign_positive() {
                     // 反手开仓
                     self.position.entry_price = fill_price;
@@ -517,11 +523,9 @@ impl StrategyEngine {
                             t.elapsed() > std::time::Duration::from_secs(60) // 防止连续高频补仓
                         } else { true };
                         
-                        // 且必须有右侧止跌反弹迹象才补仓
-                        if should_dca && bid > local_low * dec!(1.002) {
-                            info!("🛡️ [{}] 触发智能阶梯补仓 (DCA)！当前回撤: {}%，这是第 {} 次补仓", self.position.symbol, draw_down_pct.round_dp(2), dca_count + 1);
-                            self.position.dca_count += 1;
-                            self.position.save_state(&self.redis_client).await;
+                        // 直接补仓，不再等待右侧反弹，防止阴跌错过点位
+                        if should_dca {
+                            info!("🛡️ [{}] 触发补仓信号 (DCA)！当前回撤: {}%，等待成交确认...", self.position.symbol, draw_down_pct.round_dp(2));
                             let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
                                 symbol: self.position.symbol.clone(),
                                 side: "BUY".to_string(), // 补多
@@ -644,10 +648,9 @@ impl StrategyEngine {
                                 t.elapsed() > std::time::Duration::from_secs(60)
                             } else { true };
                             
-                            if should_dca && ask < local_high * dec!(0.998) {
-                                info!("🛡️ [{}] 触发智能阶梯补空 (DCA)！当前回撤: {}%，这是第 {} 次补仓", self.position.symbol, draw_down_pct.round_dp(2), dca_count + 1);
-                                self.position.dca_count += 1;
-                                self.position.save_state(&self.redis_client).await;
+                            // 直接补仓，不再等待右侧回撤
+                            if should_dca {
+                                info!("🛡️ [{}] 触发补空信号 (DCA)！当前回撤: {}%，等待成交确认...", self.position.symbol, draw_down_pct.round_dp(2));
                                 let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
                                     symbol: self.position.symbol.clone(),
                                     side: "SELL".to_string(),
