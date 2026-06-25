@@ -139,9 +139,13 @@ impl StrategyEngine {
             }
         };
 
-        let mut redis_conn = redis_client.get_async_connection().await.unwrap();
-        let pause_key = format!("strategy_paused_{}", symbol);
-        let trading_paused: bool = redis::cmd("GET").arg(&pause_key).query_async(&mut redis_conn).await.unwrap_or(false);
+        let mut trading_paused = false;
+        if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
+            let pause_key = format!("strategy_paused_{}", symbol);
+            if let Ok(Some(val)) = redis::cmd("GET").arg(&pause_key).query_async::<Option<i32>>(&mut conn).await {
+                trading_paused = val == 1;
+            }
+        }
 
         Self {
             position,
@@ -314,14 +318,16 @@ impl StrategyEngine {
             }
             ControlMessage::PauseTrading => {
                 self.trading_paused = true;
-                let mut conn = self.redis_client.get_async_connection().await.unwrap();
-                let _: () = redis::cmd("SET").arg(format!("strategy_paused_{}", self.position.symbol)).arg(1).query_async(&mut conn).await.unwrap_or(());
+                if let Ok(mut conn) = self.redis_client.get_multiplexed_async_connection().await {
+                    let _: () = redis::cmd("SET").arg(format!("strategy_paused_{}", self.position.symbol)).arg(1).query_async(&mut conn).await.unwrap_or(());
+                }
                 info!("🛑 [{}] 已接收到指令，暂停开新仓并保存至 Redis。", self.position.symbol);
             }
             ControlMessage::ResumeTrading => {
                 self.trading_paused = false;
-                let mut conn = self.redis_client.get_async_connection().await.unwrap();
-                let _: () = redis::cmd("SET").arg(format!("strategy_paused_{}", self.position.symbol)).arg(0).query_async(&mut conn).await.unwrap_or(());
+                if let Ok(mut conn) = self.redis_client.get_multiplexed_async_connection().await {
+                    let _: () = redis::cmd("SET").arg(format!("strategy_paused_{}", self.position.symbol)).arg(0).query_async(&mut conn).await.unwrap_or(());
+                }
                 info!("▶️ [{}] 已接收到指令，恢复全自动交易并保存至 Redis。", self.position.symbol);
             }
             ControlMessage::AllowShorting(allow) => {
@@ -403,9 +409,9 @@ impl StrategyEngine {
                 let _ = self.feature_tx.try_send(feature_json);
             }
 
-            if self.mid_price_history.len() < self.breakout_window {
-                self.mid_price_history.push_back(mid_price);
-                return;
+            self.mid_price_history.push_back(mid_price);
+            if self.mid_price_history.len() > self.breakout_window {
+                self.mid_price_history.pop_front();
             }
 
             let mut local_high = dec!(0);
@@ -414,10 +420,6 @@ impl StrategyEngine {
                 if p > local_high { local_high = p; }
                 if p < local_low { local_low = p; }
             }
-
-            // 更新历史窗口
-            self.mid_price_history.pop_front();
-            self.mid_price_history.push_back(mid_price);
 
             if self.tick_counter % 100 == 0 { // 约每10秒打印一次
                 info!("🔍 [切片追踪 {}] 最新价: {} | 订单簿失衡指数(OBI): {:.3} | 快买/卖流: {:.2}/{:.2} | 慢买/卖流: {:.2}/{:.2} | 30s局部高/低点: {} / {}",
@@ -460,14 +462,17 @@ impl StrategyEngine {
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
                     
                     if is_strong || ml_prob > dec!(0.75) {
-                        info!("🚀 [{}] 触发回调接多信号！级别: {} | AI 胜率: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
-                        
+                        /* 
+                        // ==========================================
+                        // 主动接多 (追高) 逻辑已物理封锁，仅作为被动雷达与 DCA 补仓工具
+                        // ==========================================
                         let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
                             symbol: self.position.symbol.clone(),
                             side: "BUY".to_string(),
                             strength: strength.to_string(),
                             price: ask,
                         }).await;
+                        */
                         self.last_signal_time = Some(std::time::Instant::now());
                     }
                 } else if ask < local_low && self.allow_shorting {
@@ -479,18 +484,19 @@ impl StrategyEngine {
                     
                     let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "SELL", &self.mid_price_history);
-
-
-
+                    
                     if is_strong || ml_prob > dec!(0.75) {
-                        info!("💥 [{}] 触发做空信号！级别: {} | AI 胜率预测: {}%", self.position.symbol, strength, (ml_prob * dec!(100)).round_dp(1));
-
+                        /*
+                        // ==========================================
+                        // 主动做空逻辑已物理封锁
+                        // ==========================================
                         let _ = self.signal_tx.send(crate::portfolio::SignalEvent {
                             symbol: self.position.symbol.clone(),
                             side: "SELL".to_string(),
                             strength: strength.to_string(),
                             price: bid,
                         }).await;
+                        */
                         self.last_signal_time = Some(std::time::Instant::now());
                     }
                 }
