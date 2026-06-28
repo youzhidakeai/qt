@@ -46,6 +46,8 @@ enum Command {
     Resume,
     #[command(description = "做空机制开关。用法: /short on 或 /short off")]
     Short(String),
+    #[command(description = "查看近期历史仓位和成交记录。用法: /history <交易对> [条数]")]
+    History(String),
 }
 
 pub async fn run_telegram_bot(
@@ -573,6 +575,60 @@ async fn answer(
                 bot.send_message(msg.chat.id, "🚫 <b>自动做空已彻底关闭！</b>\n策略引擎现已切换为纯多头（Long-Only）模式，只抓暴涨，不再做空。").parse_mode(teloxide::types::ParseMode::Html).await?;
             } else {
                 bot.send_message(msg.chat.id, "❌ 参数错误。用法: /short on 或 /short off").await?;
+            }
+        }
+        Command::History(args) => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.is_empty() {
+                bot.send_message(msg.chat.id, "❌ 参数错误。用法: /history <交易对> [条数]\n例如: /history DOGEUSDT 10").await?;
+                return Ok(());
+            }
+            let symbol = parts[0].to_uppercase();
+            let limit: u32 = if parts.len() > 1 { parts[1].parse().unwrap_or(10) } else { 10 };
+            
+            bot.send_message(msg.chat.id, format!("⏳ 正在拉取 {} 的最近 {} 条历史成交记录...", symbol, limit)).await?;
+            
+            match exec_client.get_user_trades(&symbol, limit).await {
+                Ok(res) => {
+                    if let Ok(trades) = serde_json::from_str::<Vec<serde_json::Value>>(&res) {
+                        if trades.is_empty() {
+                            bot.send_message(msg.chat.id, format!("🈳 {} 最近没有任何成交记录。", symbol)).await?;
+                        } else {
+                            let mut report = format!("📜 <b>{} 历史成交记录 (最新 {} 条)</b>\n\n", symbol, trades.len());
+                            for t in trades.iter().rev() {
+                                let time = t.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let dt = time::OffsetDateTime::from_unix_timestamp((time / 1000) as i64).unwrap_or(time::OffsetDateTime::now_utc());
+                                let dt = dt.to_offset(time::UtcOffset::from_hms(8, 0, 0).unwrap());
+                                let side = t.get("side").and_then(|v| v.as_str()).unwrap_or("");
+                                let price = t.get("price").and_then(|v| v.as_str()).unwrap_or("0");
+                                let qty = t.get("qty").and_then(|v| v.as_str()).unwrap_or("0");
+                                let realized_pnl = t.get("realizedPnl").and_then(|v| v.as_str()).unwrap_or("0");
+                                
+                                let emoji = if side == "BUY" { "🟢买" } else { "🔴卖" };
+                                let pnl_str = if realized_pnl != "0" && realized_pnl != "0.00000000" && !realized_pnl.starts_with("-0.000") {
+                                    if realized_pnl.starts_with('-') {
+                                        format!(" | 亏损: {} U", realized_pnl)
+                                    } else {
+                                        format!(" | 盈利: {} U", realized_pnl)
+                                    }
+                                } else {
+                                    "".to_string()
+                                };
+                                
+                                report.push_str(&format!("{} [{}]\n{} | 价: {} | 量: {}{}\n\n", 
+                                    emoji, dt.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                                    side, price, qty, pnl_str
+                                ));
+                            }
+                            bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
+                        }
+                    } else {
+                        bot.send_message(msg.chat.id, "⚠️ 解析历史记录失败。可能是API限制。").await?;
+                    }
+                }
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("❌ 拉取历史记录失败: {}", e)).await?;
+                }
             }
         }
     }

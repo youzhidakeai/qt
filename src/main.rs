@@ -312,6 +312,7 @@ async fn main() {
     let tg_ctx_ticker = tg_ctx_arc.clone();
     let tg_tx_ticker = tg_tx.clone();
     let redis_ticker = redis_client.clone();
+    let exec_ticker = exec_client.clone();
     tokio::spawn(async move {
         // 【关键修复】先让系统等 15 秒，等 WebSocket 深度完全建立起来再扫瞄，防止第一根 K 线拿到 0
         tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
@@ -463,8 +464,22 @@ async fn main() {
                         }
                     }
                     if price > rust_decimal::Decimal::ZERO {
+                        let mut past_prices_str = String::new();
+                        let intervals = ["1m", "5m", "15m", "30m", "1h"];
+                        for interval in intervals.iter() {
+                            if let Ok(past_price) = exec_ticker.fetch_kline_open_price(sym, interval).await {
+                                if past_price > rust_decimal::Decimal::ZERO {
+                                    let pct = (price - past_price) / past_price * rust_decimal_macros::dec!(100);
+                                    let plus = if pct > rust_decimal::Decimal::ZERO { "+" } else { "" };
+                                    past_prices_str.push_str(&format!(" {}:{}{:.2}%", interval, plus, pct));
+                                }
+                            }
+                        }
+                        if !past_prices_str.is_empty() {
+                            past_prices_str = format!("\n    📊 涨幅对比:{}", past_prices_str);
+                        }
                         last_prices.insert((*sym).clone(), price);
-                        coins_report.push_str(&format!("🔹 <b>{}</b>: {}{}{}\n", sym, price, delta_str, extra_info));
+                        coins_report.push_str(&format!("🔹 <b>{}</b>: {}{}{}{}\n", sym, price, delta_str, past_prices_str, extra_info));
                     } else {
                         coins_report.push_str(&format!("🔹 <b>{}</b>: 数据获取中...\n", sym));
                     }
