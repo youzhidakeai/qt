@@ -39,6 +39,7 @@ pub struct PositionManager {
     pub highest_price_since_entry: Decimal,
     pub lowest_price_since_entry: Decimal,
     pub dca_count: u8,
+    pub last_notified_profit_level: u32,
 }
 
 impl PositionManager {
@@ -136,6 +137,7 @@ impl StrategyEngine {
                 highest_price_since_entry: Decimal::ZERO,
                 lowest_price_since_entry: dec!(999999999),
                 dca_count: 0,
+                last_notified_profit_level: 0,
             }
         };
 
@@ -187,6 +189,7 @@ impl StrategyEngine {
                 if new_qty == Decimal::ZERO {
                     // 彻底平仓
                     self.position.position_amt = Decimal::ZERO;
+                    self.position.last_notified_profit_level = 0;
                     info!("🎯 [{}] 仓位已被完全平掉。", self.position.symbol);
                 } else if current_qty.is_sign_positive() == trade_qty.is_sign_positive() || current_qty == Decimal::ZERO {
                     // 同向加仓 (或者开新仓)
@@ -195,6 +198,7 @@ impl StrategyEngine {
                     self.position.position_amt = new_qty;
                     self.position.highest_price_since_entry = self.position.entry_price;
                     self.position.lowest_price_since_entry = self.position.entry_price;
+                    self.position.last_notified_profit_level = 0;
                     
                     if current_qty != Decimal::ZERO {
                         self.position.dca_count += 1;
@@ -208,6 +212,7 @@ impl StrategyEngine {
                     self.position.position_amt = new_qty;
                     self.position.highest_price_since_entry = fill_price;
                     self.position.lowest_price_since_entry = fill_price;
+                    self.position.last_notified_profit_level = 0;
                     info!("🎯 [{}] 反手开仓成功！总仓位: {}，新均价: {}", self.position.symbol, new_qty, fill_price);
                 } else {
                     // 部分平仓
@@ -220,6 +225,7 @@ impl StrategyEngine {
             ControlMessage::ClearPosition => {
                 self.position.position_amt = Decimal::ZERO;
                 self.position.dca_count = 0;
+                self.position.last_notified_profit_level = 0;
                 self.position.save_state(&self.redis_client).await;
             }
             ControlMessage::ClosePosition => {
@@ -235,6 +241,7 @@ impl StrategyEngine {
                     Ok(_) => {
                         self.position.position_amt = Decimal::ZERO;
                         self.position.dca_count = 0;
+                        self.position.last_notified_profit_level = 0;
                         self.position.save_state(&self.redis_client).await;
                         let _ = self.tg_tx.send(format!("✅ [{}] 一键手动平仓成功！仓位已清零。", self.position.symbol)).await;
                     }
@@ -281,6 +288,7 @@ impl StrategyEngine {
                         } else {
                             self.position.position_amt = rust_decimal::Decimal::ZERO;
                             self.position.dca_count = 0;
+                            self.position.last_notified_profit_level = 0;
                             self.position.save_state(&self.redis_client).await;
                             let _ = self.tg_tx.send(format!("⚠️ [{}] 币安 APP 上当前没有持仓。大脑记忆已同步清零。", self.position.symbol)).await;
                         }
@@ -300,6 +308,7 @@ impl StrategyEngine {
                         self.position.highest_price_since_entry = Decimal::ZERO;
                         self.position.lowest_price_since_entry = Decimal::ZERO;
                         self.position.dca_count = 0;
+                        self.position.last_notified_profit_level = 0;
                         info!("🔄 [{}] 发现仓位归零 (可能被强平/手动平仓)，已自愈更新。", self.position.symbol);
                     } else {
                         let was_zero = self.position.position_amt == Decimal::ZERO;
@@ -572,6 +581,7 @@ impl StrategyEngine {
                                         self.position.highest_price_since_entry = Decimal::ZERO;
                                         self.position.lowest_price_since_entry = Decimal::ZERO;
                                         self.position.dca_count = 0;
+                                        self.position.last_notified_profit_level = 0;
                                         self.position.save_state(&self.redis_client).await;
                                     }
                                     Err(e) => {
@@ -583,6 +593,16 @@ impl StrategyEngine {
                         }
                     }
                     let current_profit_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100);
+                    
+                    let levels = [10, 15, 20, 25, 30, 40, 50, 100];
+                    for &lvl in levels.iter() {
+                        if current_profit_pct >= Decimal::from(lvl) && self.position.last_notified_profit_level < lvl {
+                            self.position.last_notified_profit_level = lvl;
+                            let _ = self.tg_tx.send(format!("🚀 <b>【暴涨通知】</b>\n\n交易对: {}\n当前最高盈利已突破: <b>+{}%</b> 💰\n持仓量: {}\n均价: {}", self.position.symbol, lvl, self.position.position_amt.normalize(), self.position.entry_price.normalize())).await;
+                            self.position.save_state(&self.redis_client).await;
+                        }
+                    }
+                    
                     let break_even_trigger_pct = dec!(1.0);
                     let break_even_target_pct = self.round_trip_fee_pct + dec!(0.05);
 
@@ -695,6 +715,7 @@ impl StrategyEngine {
                                         self.position.highest_price_since_entry = Decimal::ZERO;
                                         self.position.lowest_price_since_entry = Decimal::ZERO;
                                         self.position.dca_count = 0;
+                                        self.position.last_notified_profit_level = 0;
                                         self.position.save_state(&self.redis_client).await;
                                     }
                                     Err(e) => {
@@ -706,6 +727,16 @@ impl StrategyEngine {
                         }
                     }
                     let current_profit_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100);
+                    
+                    let levels = [10, 15, 20, 25, 30, 40, 50, 100];
+                    for &lvl in levels.iter() {
+                        if current_profit_pct >= Decimal::from(lvl) && self.position.last_notified_profit_level < lvl {
+                            self.position.last_notified_profit_level = lvl;
+                            let _ = self.tg_tx.send(format!("🚀 <b>【暴跌爆赚通知】</b>\n\n交易对: {}\n空单当前最高盈利已突破: <b>+{}%</b> 💰\n持仓量: {}\n均价: {}", self.position.symbol, lvl, self.position.position_amt.normalize(), self.position.entry_price.normalize())).await;
+                            self.position.save_state(&self.redis_client).await;
+                        }
+                    }
+                    
                     let break_even_trigger_pct = dec!(1.0);
                     let break_even_target_pct = self.round_trip_fee_pct + dec!(0.05);
 
