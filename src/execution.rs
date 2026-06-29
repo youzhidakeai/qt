@@ -209,10 +209,15 @@ impl BinanceExecutionClient {
         res.text().await
     }
 
-    pub async fn get_user_trades(&self, symbol: &str, limit: u32) -> Result<String, reqwest::Error> {
+    pub async fn get_user_trades(&self, symbol: &str, limit: Option<u32>, start_time: Option<u64>) -> Result<String, reqwest::Error> {
         let endpoint = "/fapi/v1/userTrades";
-        let payload = format!("symbol={}&limit={}&timestamp={}",
-            symbol, limit, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+        let mut payload = format!("symbol={}&timestamp={}", symbol, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+        if let Some(l) = limit {
+            payload.push_str(&format!("&limit={}", l));
+        }
+        if let Some(st) = start_time {
+            payload.push_str(&format!("&startTime={}", st));
+        }
         let signature = self.generate_signature(&payload);
         let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
 

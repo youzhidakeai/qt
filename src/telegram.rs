@@ -580,21 +580,38 @@ async fn answer(
         Command::History(args) => {
             let parts: Vec<&str> = args.split_whitespace().collect();
             if parts.is_empty() {
-                bot.send_message(msg.chat.id, "❌ 参数错误。用法: /history <交易对> [条数]\n例如: /history DOGEUSDT 10").await?;
+                bot.send_message(msg.chat.id, "❌ 参数错误。用法: /history &lt;交易对&gt; [条数]\n例如: /history DOGEUSDT 10").await?;
                 return Ok(());
             }
             let symbol = parts[0].to_uppercase();
-            let limit: u32 = if parts.len() > 1 { parts[1].parse().unwrap_or(10) } else { 10 };
+            let limit: Option<u32> = if parts.len() > 1 { parts[1].parse().ok() } else { None };
+            let start_time: Option<u64> = if limit.is_none() {
+                use time::{OffsetDateTime, UtcOffset, Time};
+                let offset = UtcOffset::from_hms(8, 0, 0).unwrap();
+                let now_midnight = OffsetDateTime::now_utc().to_offset(offset).replace_time(Time::MIDNIGHT);
+                Some(now_midnight.unix_timestamp() as u64 * 1000)
+            } else {
+                None
+            };
             
-            bot.send_message(msg.chat.id, format!("⏳ 正在拉取 {} 的最近 {} 条历史成交记录...", symbol, limit)).await?;
+            let time_desc = if start_time.is_some() { "今日 0点起" } else { "近期" };
+            bot.send_message(msg.chat.id, format!("⏳ 正在拉取 {} 的{}历史成交记录...", symbol, time_desc)).await?;
             
-            match exec_client.get_user_trades(&symbol, limit).await {
+            match exec_client.get_user_trades(&symbol, limit, start_time).await {
                 Ok(res) => {
                     if let Ok(trades) = serde_json::from_str::<Vec<serde_json::Value>>(&res) {
                         if trades.is_empty() {
-                            bot.send_message(msg.chat.id, format!("🈳 {} 最近没有任何成交记录。", symbol)).await?;
+                            bot.send_message(msg.chat.id, format!("🈳 {} {}没有任何成交记录。", symbol, time_desc)).await?;
                         } else {
-                            let mut report = format!("📜 <b>{} 历史成交记录 (最新 {} 条)</b>\n\n", symbol, trades.len());
+                            let mut report = format!("📜 <b>{} 历史成交记录 ({})</b>\n\n", symbol, time_desc);
+                            
+                            let mut total_profit = rust_decimal::Decimal::ZERO;
+                            let mut total_loss = rust_decimal::Decimal::ZERO;
+                            let mut total_fee = rust_decimal::Decimal::ZERO;
+                            let total_trades = trades.len();
+                            
+                            let mut trade_details = String::new();
+                            
                             for t in trades.iter().rev() {
                                 let time = t.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let dt = time::OffsetDateTime::from_unix_timestamp((time / 1000) as i64).unwrap_or(time::OffsetDateTime::now_utc());
@@ -603,23 +620,46 @@ async fn answer(
                                 let price = t.get("price").and_then(|v| v.as_str()).unwrap_or("0");
                                 let qty = t.get("qty").and_then(|v| v.as_str()).unwrap_or("0");
                                 let realized_pnl = t.get("realizedPnl").and_then(|v| v.as_str()).unwrap_or("0");
+                                let commission = t.get("commission").and_then(|v| v.as_str()).unwrap_or("0");
+                                
+                                if let Ok(fee) = rust_decimal::Decimal::from_str(commission) {
+                                    total_fee += fee;
+                                }
                                 
                                 let emoji = if side == "BUY" { "🟢买" } else { "🔴卖" };
                                 let pnl_str = if realized_pnl != "0" && realized_pnl != "0.00000000" && !realized_pnl.starts_with("-0.000") {
-                                    if realized_pnl.starts_with('-') {
-                                        format!(" | 亏损: {} U", realized_pnl)
-                                    } else {
-                                        format!(" | 盈利: {} U", realized_pnl)
-                                    }
+                                    if let Ok(pnl) = rust_decimal::Decimal::from_str(realized_pnl) {
+                                        if pnl > rust_decimal::Decimal::ZERO {
+                                            total_profit += pnl;
+                                            format!(" | 盈利: {} U", pnl.normalize())
+                                        } else {
+                                            total_loss += pnl.abs();
+                                            format!(" | 亏损: {} U", pnl.abs().normalize())
+                                        }
+                                    } else { "".to_string() }
                                 } else {
                                     "".to_string()
                                 };
                                 
-                                report.push_str(&format!("{} [{}]\n{} | 价: {} | 量: {}{}\n\n", 
+                                let detail = format!("{} [{}]\n{} | 价: {} | 量: {}{}\n\n", 
                                     emoji, dt.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
                                     side, price, qty, pnl_str
-                                ));
+                                );
+                                
+                                if trade_details.len() < 3000 {
+                                    trade_details.push_str(&detail);
+                                } else if trade_details.len() < 3100 {
+                                    trade_details.push_str("... (记录过多已折叠)\n");
+                                }
                             }
+                            
+                            let net_pnl = total_profit - total_loss - total_fee;
+                            let net_emoji = if net_pnl > rust_decimal::Decimal::ZERO { "🤑" } else { "🩸" };
+                            report.push_str(&format!("{} <b>阶段汇总</b>\n🔹 <b>总交易笔数</b>: {}\n🔹 <b>总盈利</b>: {:.4} U\n🔹 <b>总亏损</b>: {:.4} U\n🔹 <b>总手续费</b>: {:.4} U\n--------------------\n💰 <b>净利润</b>: <b>{:.4} U</b>\n\n",
+                                net_emoji, total_trades, total_profit, total_loss, total_fee, net_pnl));
+                                
+                            report.push_str(&trade_details);
+                            
                             bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
                         }
                     } else {
