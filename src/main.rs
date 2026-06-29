@@ -234,7 +234,8 @@ async fn main() {
                         let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         if let Some(tx) = sync_control.get(&sym) {
                             let entry = pos.get("entryPrice").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
-                            let _ = tx.send(crate::strategy::ControlMessage::ForceUpdatePosition { amt, entry }).await;
+                            let mark_price = pos.get("markPrice").and_then(|v| v.as_str()).and_then(|s| rust_decimal::Decimal::from_str(s).ok()).unwrap_or(rust_decimal::Decimal::ZERO);
+                            let _ = tx.send(crate::strategy::ControlMessage::ForceUpdatePosition { amt, entry, mark_price }).await;
                         }
                     }
                 }

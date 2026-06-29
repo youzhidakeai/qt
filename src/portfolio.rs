@@ -164,7 +164,7 @@ impl PortfolioManager {
                     let _ = tx.send(ControlMessage::TradeExecuted { trade_qty, fill_price: actual_entry }).await;
                 }
                 let actual_notional = target_qty * actual_entry;
-                let _ = self.tg_tx.send(format!("🤖 <b>中央大脑联合执行</b>\n✅ 交易对: {}\n🎯 方向: {}\n💰 真实均价: {}\n📦 下单量: {}\n💵 交易价值: {:.2} USDT", symbol, side, actual_entry, target_qty, actual_notional)).await;
+                let _ = self.tg_tx.send(format!("🤖 <b>中央大脑联合执行</b>\n✅ 交易对: {}\n🎯 方向: {}\n💰 真实均价: {}\n📦 下单量: {}\n💵 交易价值: {:.2} USDT", symbol, side, actual_entry.round_dp(6).normalize(), target_qty, actual_notional)).await;
             }
             Err(e) => {
                 error!("中央大脑执行 {} 失败: {}", symbol, e);
