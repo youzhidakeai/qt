@@ -46,7 +46,7 @@ enum Command {
     Resume,
     #[command(description = "做空机制开关。用法: /short on 或 /short off")]
     Short(String),
-    #[command(description = "查看近期历史仓位和成交记录。用法: /history <交易对> [条数]")]
+    #[command(description = "查看近期历史仓位和成交记录。用法: /history &lt;交易对&gt; [条数]")]
     History(String),
 }
 
