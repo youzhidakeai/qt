@@ -593,12 +593,13 @@ impl StrategyEngine {
                         }
                     }
                     let current_profit_pct = (self.position.highest_price_since_entry - self.position.entry_price) / self.position.entry_price * dec!(100);
+                    let current_roe_pct = current_profit_pct * dec!(10); // 假设10倍杠杆计算ROE
                     
                     let levels = [10, 15, 20, 25, 30, 40, 50, 100];
                     for &lvl in levels.iter() {
-                        if current_profit_pct >= Decimal::from(lvl) && self.position.last_notified_profit_level < lvl {
+                        if current_roe_pct >= Decimal::from(lvl) && self.position.last_notified_profit_level < lvl {
                             self.position.last_notified_profit_level = lvl;
-                            let _ = self.tg_tx.send(format!("🚀 <b>【暴涨通知】</b>\n\n交易对: {}\n当前最高盈利已突破: <b>+{}%</b> 💰\n持仓量: {}\n均价: {}", self.position.symbol, lvl, self.position.position_amt.normalize(), self.position.entry_price.normalize())).await;
+                            let _ = self.tg_tx.send(format!("🚀 <b>【暴涨通知】</b>\n\n交易对: {}\n当前最高ROE(按10x计算)已突破: <b>+{}%</b> 💰\n持仓量: {}\n均价: {}", self.position.symbol, lvl, self.position.position_amt.normalize(), self.position.entry_price.normalize())).await;
                             self.position.save_state(&self.redis_client).await;
                         }
                     }
@@ -727,12 +728,13 @@ impl StrategyEngine {
                         }
                     }
                     let current_profit_pct = (self.position.entry_price - self.position.lowest_price_since_entry) / self.position.entry_price * dec!(100);
+                    let current_roe_pct = current_profit_pct * dec!(10); // 假设10倍杠杆计算ROE
                     
                     let levels = [10, 15, 20, 25, 30, 40, 50, 100];
                     for &lvl in levels.iter() {
-                        if current_profit_pct >= Decimal::from(lvl) && self.position.last_notified_profit_level < lvl {
+                        if current_roe_pct >= Decimal::from(lvl) && self.position.last_notified_profit_level < lvl {
                             self.position.last_notified_profit_level = lvl;
-                            let _ = self.tg_tx.send(format!("🚀 <b>【暴跌爆赚通知】</b>\n\n交易对: {}\n空单当前最高盈利已突破: <b>+{}%</b> 💰\n持仓量: {}\n均价: {}", self.position.symbol, lvl, self.position.position_amt.normalize(), self.position.entry_price.normalize())).await;
+                            let _ = self.tg_tx.send(format!("🚀 <b>【暴跌爆赚通知】</b>\n\n交易对: {}\n空单当前最高ROE(按10x计算)已突破: <b>+{}%</b> 💰\n持仓量: {}\n均价: {}", self.position.symbol, lvl, self.position.position_amt.normalize(), self.position.entry_price.normalize())).await;
                             self.position.save_state(&self.redis_client).await;
                         }
                     }
