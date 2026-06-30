@@ -471,49 +471,81 @@ async fn answer(
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
             let start_ms = now_ms - (duration_secs * 1000);
             
-            match exec_client.get_income_history(start_ms, now_ms).await {
-                Ok(income_str) => {
-                    if let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&income_str) {
-                        let mut total_pnl = 0.0;
-                        let mut total_fee = 0.0;
-                        let mut total_funding = 0.0;
-                        let mut trades_count = 0;
-                        
-                        for r in records {
-                            let income_type = r["incomeType"].as_str().unwrap_or("");
-                            let income = r["income"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-                            
-                            if income_type == "REALIZED_PNL" {
-                                total_pnl += income;
-                                trades_count += 1;
-                            } else if income_type == "COMMISSION" {
-                                total_fee += income;
-                            } else if income_type == "FUNDING_FEE" {
-                                total_funding += income;
+            let mut total_pnl = 0.0;
+            let mut total_fee = 0.0;
+            let mut total_funding = 0.0;
+            let mut trades_count = 0;
+            let mut current_start = start_ms;
+            let mut fetch_success = false;
+            let mut error_msg = String::new();
+            let mut total_records_processed = 0;
+
+            loop {
+                match exec_client.get_income_history(current_start, now_ms).await {
+                    Ok(income_str) => {
+                        if let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&income_str) {
+                            if records.is_empty() { 
+                                fetch_success = true;
+                                break; 
                             }
+                            
+                            fetch_success = true;
+                            let mut max_time = current_start;
+                            
+                            for r in &records {
+                                let t = r["time"].as_u64().unwrap_or(0);
+                                if t > max_time { max_time = t; }
+                                
+                                let income_type = r["incomeType"].as_str().unwrap_or("");
+                                let income = r["income"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+                                
+                                if income_type == "REALIZED_PNL" {
+                                    total_pnl += income;
+                                    trades_count += 1;
+                                } else if income_type == "COMMISSION" {
+                                    total_fee += income;
+                                } else if income_type == "FUNDING_FEE" {
+                                    total_funding += income;
+                                }
+                            }
+                            
+                            total_records_processed += records.len();
+                            
+                            if records.len() < 1000 {
+                                break;
+                            } else {
+                                current_start = max_time + 1;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            }
+                        } else {
+                            error_msg = "解析币安收益数据失败。可能是查询跨度超出限制或数据异常。".to_string();
+                            break;
                         }
-                        
-                        let net_profit = total_pnl + total_fee + total_funding;
-                        let emoji = if net_profit > 0.0 { "🤑" } else { "🩸" };
-                        
-                        let report = format!(
-                            "{} <b>过去 {} 收益报告</b>\n\n\
-                             🔹 <b>总实现盈亏</b>: {:.4} USDT\n\
-                             🔹 <b>交易手续费</b>: {:.4} USDT\n\
-                             🔹 <b>资金费率</b>: {:.4} USDT\n\
-                             ----------------------------\n\
-                             💰 <b>最终净利润</b>: <b>{:.4} USDT</b>\n\
-                             (涵盖 {} 笔盈亏流水记录)",
-                             emoji, arg, total_pnl, total_fee, total_funding, net_profit, trades_count
-                        );
-                        bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
-                    } else {
-                        bot.send_message(msg.chat.id, "⚠️ 解析币安收益数据失败。可能是查询跨度超出币安单次查询限制。").await?;
+                    }
+                    Err(e) => {
+                        error_msg = format!("拉取收益数据失败：{}", e);
+                        break;
                     }
                 }
-                Err(e) => {
-                    bot.send_message(msg.chat.id, format!("⚠️ 拉取收益数据失败：{}", e)).await?;
-                }
+            }
+            
+            if fetch_success && error_msg.is_empty() {
+                let net_profit = total_pnl + total_fee + total_funding;
+                let emoji = if net_profit > 0.0 { "🤑" } else { "🩸" };
+                
+                let report = format!(
+                    "{} <b>过去 {} 收益报告</b>\n\n\
+                     🔹 <b>总实现盈亏</b>: {:.4} USDT\n\
+                     🔹 <b>交易手续费</b>: {:.4} USDT\n\
+                     🔹 <b>资金费率</b>: {:.4} USDT\n\
+                     ----------------------------\n\
+                     💰 <b>最终净利润</b>: <b>{:.4} USDT</b>\n\
+                     (涵盖 {} 笔盈亏流水记录, 共解析 {} 条底层数据)",
+                     emoji, arg, total_pnl, total_fee, total_funding, net_profit, trades_count, total_records_processed
+                );
+                bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
+            } else {
+                bot.send_message(msg.chat.id, format!("⚠️ {}", error_msg)).await?;
             }
         }
         Command::Sub(args) => {
