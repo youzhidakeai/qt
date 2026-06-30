@@ -104,6 +104,7 @@ pub struct StrategyEngine {
     pub trading_paused: bool,
     pub allow_shorting: bool,
     
+    #[allow(dead_code)]
     pub signal_tx: mpsc::Sender<crate::portfolio::SignalEvent>,
     pub last_signal_time: Option<std::time::Instant>,
     pub current_funding_rate: Decimal,
@@ -477,7 +478,7 @@ impl StrategyEngine {
                     let is_strong_slow = self.slow_buy_flow > self.slow_sell_flow * dec!(1.5) && self.slow_buy_flow > min_flow_threshold * dec!(1.5);
                     let is_strong = is_strong_fast && is_strong_slow;
                     
-                    let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
+                    let _strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
                     
                     if is_strong || ml_prob > dec!(0.75) {
@@ -501,7 +502,7 @@ impl StrategyEngine {
                     let is_strong_slow = self.slow_sell_flow > self.slow_buy_flow * dec!(3.0) && self.slow_sell_flow > min_flow_threshold * dec!(3.0);
                     let is_strong = is_strong_fast && is_strong_slow;
                     
-                    let strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
+                    let _strength = if is_strong { "S" } else if is_strong_fast { "A" } else { "B" };
                     let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "SELL", &self.mid_price_history);
                     
                     if is_strong || ml_prob > dec!(0.75) {
@@ -704,6 +705,7 @@ impl StrategyEngine {
         }
     }
 
+    #[allow(dead_code)]
     async fn record_trade_history(&self, side: &str, exit_price: Decimal, gross_pnl: Decimal, fee: Decimal, net_pnl: Decimal) {
         let now = time::OffsetDateTime::now_utc();
         let date_str = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
