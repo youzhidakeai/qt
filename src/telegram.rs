@@ -479,6 +479,7 @@ async fn answer(
             let mut fetch_success = false;
             let mut error_msg = String::new();
             let mut total_records_processed = 0;
+            let mut processed_tran_ids = std::collections::HashSet::new();
 
             loop {
                 match exec_client.get_income_history(current_start, now_ms).await {
@@ -491,8 +492,17 @@ async fn answer(
                             
                             fetch_success = true;
                             let mut max_time = current_start;
+                            let mut new_records = 0;
                             
                             for r in &records {
+                                let tran_id = r["tranId"].as_str().map(|s| s.to_string()).or_else(|| r["tranId"].as_u64().map(|v| v.to_string())).unwrap_or_default();
+                                if !tran_id.is_empty() {
+                                    if !processed_tran_ids.insert(tran_id) {
+                                        continue; // Skip if already processed
+                                    }
+                                }
+                                
+                                new_records += 1;
                                 let t = r["time"].as_u64().unwrap_or(0);
                                 if t > max_time { max_time = t; }
                                 
@@ -509,12 +519,12 @@ async fn answer(
                                 }
                             }
                             
-                            total_records_processed += records.len();
+                            total_records_processed += new_records;
                             
-                            if records.len() < 1000 {
+                            if records.len() < 1000 || new_records == 0 {
                                 break;
                             } else {
-                                current_start = max_time + 1;
+                                current_start = max_time; // Keep the same millisecond to ensure no skips, deduplication handles overlaps
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                             }
                         } else {
