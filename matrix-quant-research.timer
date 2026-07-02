@@ -1,0 +1,11 @@
+[Unit]
+Description=每日定时跑 Matrix Quant 研究管线
+
+[Timer]
+# 服务器本地时间(北京时间)每天 05:30，避开交易高峰且前一日数据已完整
+OnCalendar=*-*-* 05:30:00
+# 错过(如停机)则开机后补跑一次
+Persistent=true
+
+[Install]
+WantedBy=timers.target

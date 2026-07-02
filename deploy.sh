@@ -45,6 +45,35 @@ fi
 sudo chown -R $USER:$USER "$DEPLOY_DIR" # 根据需要更改权限
 sudo chmod +x "$DEPLOY_DIR/$APP_NAME"
 
+# 3.5 部署 Python 研究管线 (research/) 并注册每日定时任务
+RESEARCH_SERVICE="matrix-quant-research.service"
+RESEARCH_TIMER="matrix-quant-research.timer"
+if [ -d "research" ]; then
+    echo "🐍 正在同步 Python 研究管线到 $DEPLOY_DIR/research ..."
+    # 排除 venv 和已下载的 K 线数据; 不带 --delete, 服务器上已有的 data/ 增量数据不会被清掉
+    sudo rsync -a --exclude='.venv' --exclude='data' --exclude='__pycache__' research/ "$DEPLOY_DIR/research/"
+    sudo mkdir -p "$DEPLOY_DIR/research/data"
+    sudo chown -R $USER:$USER "$DEPLOY_DIR/research"
+    sudo chmod +x "$DEPLOY_DIR/research/rerun.sh"
+
+    # 首次部署自动建 venv 并装依赖 (仅 pandas/numpy, 其余为标准库)
+    if [ ! -x "$DEPLOY_DIR/research/.venv/bin/python" ]; then
+        echo "📦 未发现 venv, 正在创建并安装依赖 (pandas numpy)..."
+        if ! python3 -m venv "$DEPLOY_DIR/research/.venv"; then
+            echo "❌ venv 创建失败, 请先执行: sudo apt install python3-venv"
+            exit 1
+        fi
+        "$DEPLOY_DIR/research/.venv/bin/pip" install -q pandas numpy
+    fi
+
+    if [ -f "$RESEARCH_SERVICE" ] && [ -f "$RESEARCH_TIMER" ]; then
+        echo "⏰ 正在注册研究管线每日定时任务 (05:30)..."
+        sudo cp "$RESEARCH_SERVICE" "$RESEARCH_TIMER" "$SYSTEMD_DIR/"
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now "$RESEARCH_TIMER"
+    fi
+fi
+
 # 4. 部署 Systemd 服务文件
 if [ -f "$SERVICE_NAME" ]; then
     echo "📝 发现服务配置文件 $SERVICE_NAME, 正在注册到 Systemd..."
@@ -75,6 +104,10 @@ if sudo systemctl is-active --quiet ${SERVICE_NAME%.*}; then
     echo "--------------------------------------------------------"
     echo "你可以使用以下命令查看实时引擎日志："
     echo "👉 sudo journalctl -fu ${SERVICE_NAME%.*}"
+    echo "研究管线每日 05:30 自动跑, 查看排期/手动触发/看日志："
+    echo "👉 systemctl list-timers ${RESEARCH_TIMER%.*}"
+    echo "👉 sudo systemctl start ${RESEARCH_SERVICE%.*}"
+    echo "👉 sudo journalctl -u ${RESEARCH_SERVICE%.*} -n 50"
     echo "--------------------------------------------------------"
     echo "请打开 Telegram，向你的机器人发送 /status 检查网络连通性。"
 else

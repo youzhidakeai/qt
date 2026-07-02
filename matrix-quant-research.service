@@ -1,0 +1,13 @@
+[Unit]
+Description=Matrix Quant Research Pipeline (账户流水 -> 回合重建 -> K线 -> 画像 -> 回测)
+# 纯离线分析，不碰交易接口；失败不影响交易引擎
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/matrix-quant/research
+ExecStart=/opt/matrix-quant/research/rerun.sh
+# 全市场 K 线增量下载可能较慢，放宽超时
+TimeoutStartSec=2h
