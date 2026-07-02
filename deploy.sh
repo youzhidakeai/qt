@@ -12,6 +12,11 @@ SERVICE_NAME="matrix-quant.service"
 DEPLOY_DIR="/opt/matrix-quant"
 SYSTEMD_DIR="/etc/systemd/system"
 
+# 部署目录所有权必须给 systemd 里声明的运行用户 (而不是执行部署的登录用户),
+# 否则服务运行时写 feature_logs 等目录会 Permission denied
+SERVICE_USER=$(sed -n 's/^User=//p' "$SERVICE_NAME" 2>/dev/null)
+SERVICE_USER=${SERVICE_USER:-$USER}
+
 echo "🚀 开始部署 Matrix Quant Engine..."
 
 # 1. 检查环境
@@ -42,7 +47,9 @@ if [ -f ".env" ]; then
     sudo cp .env "$DEPLOY_DIR/"
 fi
 
-sudo chown -R $USER:$USER "$DEPLOY_DIR" # 根据需要更改权限
+# 特征落盘目录随部署建好, 避免服务运行时因目录缺失/无权限而丢数据
+sudo mkdir -p "$DEPLOY_DIR/feature_logs"
+sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEPLOY_DIR"
 sudo chmod +x "$DEPLOY_DIR/$APP_NAME"
 
 # 3.5 部署 Python 研究管线 (research/) 并注册每日定时任务
@@ -53,18 +60,19 @@ if [ -d "research" ]; then
     # 排除 venv 和已下载的 K 线数据; 不带 --delete, 服务器上已有的 data/ 增量数据不会被清掉
     sudo rsync -a --exclude='.venv' --exclude='data' --exclude='__pycache__' research/ "$DEPLOY_DIR/research/"
     sudo mkdir -p "$DEPLOY_DIR/research/data"
-    sudo chown -R $USER:$USER "$DEPLOY_DIR/research"
     sudo chmod +x "$DEPLOY_DIR/research/rerun.sh"
 
     # 首次部署自动建 venv 并装依赖 (仅 pandas/numpy, 其余为标准库)
     if [ ! -x "$DEPLOY_DIR/research/.venv/bin/python" ]; then
         echo "📦 未发现 venv, 正在创建并安装依赖 (pandas numpy)..."
-        if ! python3 -m venv "$DEPLOY_DIR/research/.venv"; then
+        if ! sudo python3 -m venv "$DEPLOY_DIR/research/.venv"; then
             echo "❌ venv 创建失败, 请先执行: sudo apt install python3-venv"
             exit 1
         fi
-        "$DEPLOY_DIR/research/.venv/bin/pip" install -q pandas numpy
+        sudo "$DEPLOY_DIR/research/.venv/bin/pip" install -q pandas numpy
     fi
+    # 研究管线同样以 $SERVICE_USER 运行 (见 matrix-quant-research.service)
+    sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEPLOY_DIR/research"
 
     if [ -f "$RESEARCH_SERVICE" ] && [ -f "$RESEARCH_TIMER" ]; then
         echo "⏰ 正在注册研究管线每日定时任务 (05:30)..."
