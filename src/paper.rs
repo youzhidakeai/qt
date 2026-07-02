@@ -66,6 +66,7 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
     let http = reqwest::Client::new();
     let mut cooldown: HashMap<String, std::time::Instant> = HashMap::new();
     let report_offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+    let mut scan_n: u64 = 0;
     info!("📝 纸面交易引擎已启动 (dip变体/3%回撤/不加仓, 虚拟 {}U/仓, 零实弹)", NOTIONAL);
 
     loop {
@@ -75,6 +76,12 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             Err(_) => continue,
         };
         let enabled = redis::cmd("GET").arg("PAPER_ENABLED").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_else(|| "1".into());
+
+        // 每小时一条心跳进 journal, 证明扫描循环活着 (无信号 ≠ 引擎死了)
+        scan_n += 1;
+        if scan_n % 60 == 1 {
+            info!("📝 [纸面] 扫描心跳: 第 {} 轮, 开关={}", scan_n, enabled);
+        }
 
         // ---------- 0. 每日战报 (20点后第一个循环推送; 停用时也报, 作为心跳) ----------
         // 去重状态放 Redis, 引擎重启不会重复推送
