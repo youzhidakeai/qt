@@ -6,6 +6,7 @@ mod strategy;
 mod telegram;
 mod portfolio;
 mod ml_engine;
+mod guardian;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,21 +106,56 @@ async fn main() {
     
     let redis_logger = redis_client.clone();
     tokio::spawn(async move {
+        use std::io::Write;
+        // 特征流落盘: 每天一个 jsonl 文件，供 research/ 离线画像与回测使用
+        let log_dir = std::env::var("FEATURE_LOG_DIR").unwrap_or_else(|_| "feature_logs".to_string());
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_offset = UtcOffset::from_hms(8, 0, 0).unwrap();
+        let mut cur_day = String::new();
+        let mut writer: Option<std::io::BufWriter<std::fs::File>> = None;
+        let mut line_count: u64 = 0;
+
         loop {
             match redis_logger.get_multiplexed_async_connection().await {
                 Ok(mut con) => {
                     tracing::info!("✅ Redis 特征流异步管道连接成功，等待数据...");
                     while let Some(json_str) = feature_rx.recv().await {
+                        // MAXLEN ~50万 裁剪，防止 Stream 无限膨胀吃光内存
                         let res: Result<(), redis::RedisError> = redis::cmd("XADD")
                             .arg("ML_FEATURE_STREAM")
+                            .arg("MAXLEN").arg("~").arg(500_000)
                             .arg("*")
                             .arg("data")
                             .arg(&json_str)
                             .query_async(&mut con).await;
-                        
+
                         if let Err(e) = res {
                             tracing::error!("❌ 写入 Redis Stream 失败: {}", e);
                             break; // 退出 while，触发重新连接
+                        }
+
+                        let now = time::OffsetDateTime::now_utc().to_offset(log_offset);
+                        let day = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
+                        if day != cur_day {
+                            if let Some(mut w) = writer.take() {
+                                let _ = w.flush();
+                            }
+                            let path = format!("{}/features_{}.jsonl", log_dir, day);
+                            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                                Ok(f) => {
+                                    writer = Some(std::io::BufWriter::new(f));
+                                    cur_day = day;
+                                    tracing::info!("📼 特征录制器已切换到新文件: {}", path);
+                                }
+                                Err(e) => tracing::error!("❌ 特征落盘文件打开失败: {}", e),
+                            }
+                        }
+                        if let Some(w) = writer.as_mut() {
+                            let _ = writeln!(w, "{}", json_str);
+                            line_count += 1;
+                            if line_count % 100 == 0 {
+                                let _ = w.flush();
+                            }
                         }
                     }
                 }
@@ -217,6 +253,17 @@ async fn main() {
     tokio::spawn(async move {
         let pm = portfolio::PortfolioManager::new(portfolio_exec, control_senders_clone, signal_rx, portfolio_tg, portfolio_exchange, portfolio_redis);
         pm.run().await;
+    });
+
+    // ==========================================
+    // MODULE: 仓位保镖 (自动硬止损 + 持仓超时监控)
+    // ==========================================
+    let guard_exec = exec_client.clone();
+    let guard_redis = redis_client.clone();
+    let guard_tg = tg_tx.clone();
+    let guard_exchange = exchange_info.clone();
+    tokio::spawn(async move {
+        guardian::run_guardian(guard_exec, guard_redis, guard_tg, guard_exchange).await;
     });
 
     // ==========================================
@@ -545,41 +592,19 @@ async fn main() {
             let start_ts = start_of_yesterday.unix_timestamp() * 1000;
             let end_ts = end_of_yesterday.unix_timestamp() * 1000;
             
-            if let Ok(res) = exec_daily.get_income_history(start_ts as u64, end_ts as u64).await {
-                if let Ok(records) = serde_json::from_str::<serde_json::Value>(&res) {
-                    if let Some(arr) = records.as_array() {
-                        let mut total_pnl = rust_decimal::Decimal::ZERO;
-                        let mut total_fee = rust_decimal::Decimal::ZERO;
-                        let mut total_funding = rust_decimal::Decimal::ZERO;
-                        
-                        for item in arr {
-                            if let (Some(income_type), Some(income)) = (item.get("incomeType").and_then(|v| v.as_str()), item.get("income").and_then(|v| v.as_str())) {
-                                if let Ok(val) = rust_decimal::Decimal::from_str(income) {
-                                    match income_type {
-                                        "REALIZED_PNL" => total_pnl += val,
-                                        "COMMISSION" => total_fee += val,
-                                        "FUNDING_FEE" => total_funding += val,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        
-                        let net_income = total_pnl + total_fee + total_funding;
-                        let report = format!(
-                            "⏰ <b>零点播报</b> 📊 <b>昨日盈亏总结 (UTC+8)</b>\n\n\
-                            区间: {} 00:00 ~ 23:59\n\
-                            \n\
-                            💰 净收益: <b>{:.2} USDT</b>\n\
-                            -------------------------\n\
-                            📈 实现盈亏: {:.2} USDT\n\
-                            📉 交易手续费: {:.2} USDT\n\
-                            ⏱ 资金费率: {:.2} USDT",
-                            start_of_yesterday.date(), net_income, total_pnl, total_fee, total_funding
-                        );
-                        let _ = tg_tx_daily.send(report).await;
-                    }
-                }
+            if let Ok(summary) = exec_daily.get_income_summary(start_ts as u64, end_ts as u64).await {
+                let report = format!(
+                    "⏰ <b>零点播报</b> 📊 <b>昨日盈亏总结 (UTC+8)</b>\n\n\
+                    区间: {} 00:00 ~ 23:59\n\
+                    \n\
+                    💰 净收益: <b>{:.2} USDT</b>\n\
+                    -------------------------\n\
+                    📈 实现盈亏: {:.2} USDT\n\
+                    📉 交易手续费: {:.2} USDT\n\
+                    ⏱ 资金费率: {:.2} USDT",
+                    start_of_yesterday.date(), summary.net(), summary.realized_pnl, summary.commission, summary.funding_fee
+                );
+                let _ = tg_tx_daily.send(report).await;
             }
             
             // 强制休眠 60 秒，避免 0 点边界重复触发
@@ -600,6 +625,14 @@ async fn main() {
         // 延迟 5 分钟后再启动首次扫描，防止刚开机就重启
         tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
         run_auto_rotator(rotator_redis, rotator_exec, rotator_tg).await;
+    });
+
+    // ==========================================
+    // MODULE: 机器学习模型权重热重载任务
+    // ==========================================
+    let ml_redis = redis_client.clone();
+    tokio::spawn(async move {
+        run_ml_hot_reload(ml_redis).await;
     });
 
     info!("矩阵核心系统正在运行中 (Matrix Engine Core Running)... 按 Ctrl+C 终止");

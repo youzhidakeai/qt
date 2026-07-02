@@ -48,6 +48,8 @@ enum Command {
     Short(String),
     #[command(description = "查看近期历史仓位和成交记录。用法: /history [交易对] [天数]")]
     History(String),
+    #[command(description = "仓位保镖。用法: /guard status | on | off | stop &lt;百分比&gt; | alert &lt;分钟&gt; | autoclose &lt;分钟&gt;|off")]
+    Guard(String),
 }
 
 pub async fn run_telegram_bot(
@@ -135,42 +137,20 @@ async fn answer(
             let start_ts = start_of_yesterday.unix_timestamp() * 1000;
             let end_ts = end_of_yesterday.unix_timestamp() * 1000;
             
-            if let Ok(res) = exec_client.get_income_history(start_ts as u64, end_ts as u64).await {
-                if let Ok(records) = serde_json::from_str::<serde_json::Value>(&res) {
-                    if let Some(arr) = records.as_array() {
-                        let mut total_pnl = rust_decimal::Decimal::ZERO;
-                        let mut total_fee = rust_decimal::Decimal::ZERO;
-                        let mut total_funding = rust_decimal::Decimal::ZERO;
-                        
-                        for item in arr {
-                            if let (Some(income_type), Some(income)) = (item.get("incomeType").and_then(|v| v.as_str()), item.get("income").and_then(|v| v.as_str())) {
-                                if let Ok(val) = rust_decimal::Decimal::from_str(income) {
-                                    match income_type {
-                                        "REALIZED_PNL" => total_pnl += val,
-                                        "COMMISSION" => total_fee += val,
-                                        "FUNDING_FEE" => total_funding += val,
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                        
-                        let net_income = total_pnl + total_fee + total_funding;
-                        let report = format!(
-                            "📊 <b>昨日盈亏总结 (UTC+8)</b>\n\n\
-                            区间: {} 00:00 ~ 23:59\n\
-                            \n\
-                            💰 净收益: <b>{:.2} USDT</b>\n\
-                            -------------------------\n\
-                            📈 实现盈亏: {:.2} USDT\n\
-                            📉 交易手续费: {:.2} USDT\n\
-                            ⏱ 资金费率: {:.2} USDT",
-                            start_of_yesterday.date(), net_income, total_pnl, total_fee, total_funding
-                        );
-                        bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
-                        return Ok(());
-                    }
-                }
+            if let Ok(summary) = exec_client.get_income_summary(start_ts as u64, end_ts as u64).await {
+                let report = format!(
+                    "📊 <b>昨日盈亏总结 (UTC+8)</b>\n\n\
+                    区间: {} 00:00 ~ 23:59\n\
+                    \n\
+                    💰 净收益: <b>{:.2} USDT</b>\n\
+                    -------------------------\n\
+                    📈 实现盈亏: {:.2} USDT\n\
+                    📉 交易手续费: {:.2} USDT\n\
+                    ⏱ 资金费率: {:.2} USDT",
+                    start_of_yesterday.date(), summary.net(), summary.realized_pnl, summary.commission, summary.funding_fee
+                );
+                bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
+                return Ok(());
             }
             bot.send_message(msg.chat.id, "❌ 获取昨日盈亏数据失败，可能是 API 调用限制或无数据。").parse_mode(teloxide::types::ParseMode::Html).await?;
         }
@@ -470,92 +450,27 @@ async fn answer(
             use std::time::{SystemTime, UNIX_EPOCH};
             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
             let start_ms = now_ms - (duration_secs * 1000);
-            
-            let mut total_pnl = 0.0;
-            let mut total_fee = 0.0;
-            let mut total_funding = 0.0;
-            let mut trades_count = 0;
-            let mut current_start = start_ms;
-            let mut fetch_success = false;
-            let mut error_msg = String::new();
-            let mut total_records_processed = 0;
-            let mut processed_tran_ids = std::collections::HashSet::new();
 
-            loop {
-                match exec_client.get_income_history(current_start, now_ms).await {
-                    Ok(income_str) => {
-                        if let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&income_str) {
-                            if records.is_empty() { 
-                                fetch_success = true;
-                                break; 
-                            }
-                            
-                            fetch_success = true;
-                            let mut max_time = current_start;
-                            let mut new_records = 0;
-                            
-                            for r in &records {
-                                let tran_id = r["tranId"].as_str().map(|s| s.to_string()).or_else(|| r["tranId"].as_u64().map(|v| v.to_string())).unwrap_or_default();
-                                if !tran_id.is_empty() {
-                                    if !processed_tran_ids.insert(tran_id) {
-                                        continue; // Skip if already processed
-                                    }
-                                }
-                                
-                                new_records += 1;
-                                let t = r["time"].as_u64().unwrap_or(0);
-                                if t > max_time { max_time = t; }
-                                
-                                let income_type = r["incomeType"].as_str().unwrap_or("");
-                                let income = r["income"].as_str().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-                                
-                                if income_type == "REALIZED_PNL" {
-                                    total_pnl += income;
-                                    trades_count += 1;
-                                } else if income_type == "COMMISSION" {
-                                    total_fee += income;
-                                } else if income_type == "FUNDING_FEE" {
-                                    total_funding += income;
-                                }
-                            }
-                            
-                            total_records_processed += new_records;
-                            
-                            if records.len() < 1000 || new_records == 0 {
-                                break;
-                            } else {
-                                current_start = max_time; // Keep the same millisecond to ensure no skips, deduplication handles overlaps
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            }
-                        } else {
-                            error_msg = "解析币安收益数据失败。可能是查询跨度超出限制或数据异常。".to_string();
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error_msg = format!("拉取收益数据失败：{}", e);
-                        break;
-                    }
+            match exec_client.get_income_summary(start_ms, now_ms).await {
+                Ok(summary) => {
+                    let net_profit = summary.net();
+                    let emoji = if net_profit > Decimal::ZERO { "🤑" } else { "🩸" };
+
+                    let report = format!(
+                        "{} <b>过去 {} 收益报告</b>\n\n\
+                         🔹 <b>总实现盈亏</b>: {:.4} USDT\n\
+                         🔹 <b>交易手续费</b>: {:.4} USDT\n\
+                         🔹 <b>资金费率</b>: {:.4} USDT\n\
+                         ----------------------------\n\
+                         💰 <b>最终净利润</b>: <b>{:.4} USDT</b>\n\
+                         (涵盖 {} 笔盈亏流水记录, 共解析 {} 条底层数据)",
+                         emoji, arg, summary.realized_pnl, summary.commission, summary.funding_fee, net_profit, summary.trades_count, summary.records_processed
+                    );
+                    bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
                 }
-            }
-            
-            if fetch_success && error_msg.is_empty() {
-                let net_profit = total_pnl + total_fee + total_funding;
-                let emoji = if net_profit > 0.0 { "🤑" } else { "🩸" };
-                
-                let report = format!(
-                    "{} <b>过去 {} 收益报告</b>\n\n\
-                     🔹 <b>总实现盈亏</b>: {:.4} USDT\n\
-                     🔹 <b>交易手续费</b>: {:.4} USDT\n\
-                     🔹 <b>资金费率</b>: {:.4} USDT\n\
-                     ----------------------------\n\
-                     💰 <b>最终净利润</b>: <b>{:.4} USDT</b>\n\
-                     (涵盖 {} 笔盈亏流水记录, 共解析 {} 条底层数据)",
-                     emoji, arg, total_pnl, total_fee, total_funding, net_profit, trades_count, total_records_processed
-                );
-                bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
-            } else {
-                bot.send_message(msg.chat.id, format!("⚠️ {}", error_msg)).await?;
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("⚠️ {}", e)).await?;
+                }
             }
         }
         Command::Sub(args) => {
@@ -735,6 +650,114 @@ async fn answer(
             report.push_str(&trade_details);
             
             bot.send_message(msg.chat.id, report).parse_mode(teloxide::types::ParseMode::Html).await?;
+        }
+        Command::Guard(args) => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            let mut con = match redis::Client::open(redis_url).ok() {
+                Some(c) => match c.get_multiplexed_async_connection().await {
+                    Ok(con) => con,
+                    Err(e) => {
+                        bot.send_message(msg.chat.id, format!("❌ Redis 连接失败: {}", e)).await?;
+                        return Ok(());
+                    }
+                },
+                None => {
+                    bot.send_message(msg.chat.id, "❌ Redis 配置无效").await?;
+                    return Ok(());
+                }
+            };
+
+            let set = |con: &mut redis::aio::MultiplexedConnection, key: &'static str, val: String| {
+                let mut con = con.clone();
+                async move {
+                    let _: () = redis::cmd("SET").arg(key).arg(val).query_async(&mut con).await.unwrap_or(());
+                }
+            };
+
+            let reply = match parts.as_slice() {
+                [] | ["status"] => {
+                    let get = |key: &str, def: &str| {
+                        let mut con = con.clone();
+                        let key = key.to_string();
+                        let def = def.to_string();
+                        async move {
+                            redis::cmd("GET").arg(&key).query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or(def)
+                        }
+                    };
+                    let enabled = get("GUARD_ENABLED", "1").await;
+                    let stop = get("GUARD_STOP_PCT", "5.0").await;
+                    let alert = get("GUARD_HOLD_ALERT_MIN", "30").await;
+                    let ac = get("GUARD_AUTO_CLOSE_MIN", "0").await;
+                    let guarded: Vec<String> = redis::cmd("KEYS").arg("GUARD_OPENED_*").query_async(&mut con).await.unwrap_or_default();
+                    let mut pos_lines = String::new();
+                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    for key in &guarded {
+                        let sym = key.trim_start_matches("GUARD_OPENED_");
+                        if let Ok(Some(ts)) = redis::cmd("GET").arg(key).query_async::<Option<String>>(&mut con).await {
+                            if let Ok(ts) = ts.parse::<u64>() {
+                                pos_lines.push_str(&format!("  • {} (已持仓 {} 分钟)\n", sym, now_ms.saturating_sub(ts) / 60_000));
+                            }
+                        }
+                    }
+                    if pos_lines.is_empty() {
+                        pos_lines = "  (当前无被监护的仓位)\n".to_string();
+                    }
+                    format!(
+                        "🛡 <b>仓位保镖状态</b>\n\n\
+                        开关: {}\n\
+                        硬止损线: 开仓价 ±{}% (交易所侧 STOP_MARKET, 标记价格触发)\n\
+                        持仓超时提醒: {} 分钟\n\
+                        超时自动平仓: {}\n\n\
+                        <b>监护中的仓位:</b>\n{}",
+                        if enabled == "1" { "✅ 开启" } else { "⛔️ 关闭" },
+                        stop, alert,
+                        if ac == "0" { "关闭 (用 /guard autoclose <分钟> 开启)".to_string() } else { format!("{} 分钟", ac) },
+                        pos_lines
+                    )
+                }
+                ["on"] => {
+                    set(&mut con, "GUARD_ENABLED", "1".into()).await;
+                    "🛡 保镖已开启，10 秒内开始巡逻。".to_string()
+                }
+                ["off"] => {
+                    set(&mut con, "GUARD_ENABLED", "0".into()).await;
+                    "⚠️ 保镖已下岗！新仓位不会再自动挂止损，已挂的止损单保留。".to_string()
+                }
+                ["stop", v] => {
+                    match v.parse::<f64>() {
+                        Ok(p) if (0.5..=50.0).contains(&p) => {
+                            set(&mut con, "GUARD_STOP_PCT", v.to_string()).await;
+                            format!("✅ 硬止损线已设为开仓价 ±{}%。已挂的止损单在均价漂移后会自动按新参数重挂，或平仓后对新仓生效。", p)
+                        }
+                        _ => "❌ 无效参数，范围 0.5 ~ 50 (百分比)。例: /guard stop 5".to_string(),
+                    }
+                }
+                ["alert", v] => {
+                    match v.parse::<u64>() {
+                        Ok(m) if m > 0 => {
+                            set(&mut con, "GUARD_HOLD_ALERT_MIN", v.to_string()).await;
+                            format!("✅ 持仓超时提醒已设为 {} 分钟 (之后每 {} 分钟重复提醒)。", m, m)
+                        }
+                        _ => "❌ 无效参数。例: /guard alert 30".to_string(),
+                    }
+                }
+                ["autoclose", "off"] | ["autoclose", "0"] => {
+                    set(&mut con, "GUARD_AUTO_CLOSE_MIN", "0".into()).await;
+                    "✅ 超时自动平仓已关闭，超时后只提醒不动手。".to_string()
+                }
+                ["autoclose", v] => {
+                    match v.parse::<u64>() {
+                        Ok(m) if m > 0 => {
+                            set(&mut con, "GUARD_AUTO_CLOSE_MIN", v.to_string()).await;
+                            format!("✂️ 超时自动平仓已开启: 任何仓位持有满 {} 分钟将被市价平掉。", m)
+                        }
+                        _ => "❌ 无效参数。例: /guard autoclose 60 或 /guard autoclose off".to_string(),
+                    }
+                }
+                _ => "用法:\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 5 - 硬止损百分比\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
+            };
+            bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
     }
     Ok(())

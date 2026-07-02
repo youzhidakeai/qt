@@ -7,6 +7,21 @@ use std::str::FromStr;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Debug, Default, Clone)]
+pub struct IncomeSummary {
+    pub realized_pnl: Decimal,
+    pub commission: Decimal,
+    pub funding_fee: Decimal,
+    pub trades_count: u32,
+    pub records_processed: u32,
+}
+
+impl IncomeSummary {
+    pub fn net(&self) -> Decimal {
+        self.realized_pnl + self.commission + self.funding_fee
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SymbolInfo {
     pub symbol: String,
@@ -164,6 +179,69 @@ impl BinanceExecutionClient {
         }
     }
 
+    // 挂交易所侧的整仓止损单 (STOP_MARKET + closePosition)，触发后市价平掉全部仓位，只减仓不开仓
+    pub async fn place_stop_market_close(&self, symbol: &str, side: &str, stop_price: &str) -> Result<u64, String> {
+        let endpoint = "/fapi/v1/order";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+
+        let payload = format!(
+            "symbol={}&side={}&type=STOP_MARKET&closePosition=true&stopPrice={}&workingType=MARK_PRICE&recvWindow=60000&timestamp={}",
+            symbol, side, stop_price, timestamp
+        );
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = res.status();
+        let text = res.text().await.map_err(|e| e.to_string())?;
+        if status.is_success() {
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            v["orderId"].as_u64().ok_or_else(|| format!("下单成功但无 orderId: {}", text))
+        } else {
+            Err(format!("挂止损单失败: {}", text))
+        }
+    }
+
+    pub async fn get_open_orders(&self, symbol: &str) -> Result<String, String> {
+        let endpoint = "/fapi/v1/openOrders";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let payload = format!("symbol={}&recvWindow=60000&timestamp={}", symbol, timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        res.text().await.map_err(|e| e.to_string())
+    }
+
+    pub async fn cancel_order(&self, symbol: &str, order_id: u64) -> Result<(), String> {
+        let endpoint = "/fapi/v1/order";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let payload = format!("symbol={}&orderId={}&recvWindow=60000&timestamp={}", symbol, order_id, timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("撤单失败: {}", res.text().await.unwrap_or_default()))
+        }
+    }
+
     pub async fn check_account(&self) -> Result<String, reqwest::Error> {
         let endpoint = "/fapi/v2/account";
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
@@ -207,6 +285,60 @@ impl BinanceExecutionClient {
             .await?;
 
         res.text().await
+    }
+
+    // 分页拉取区间内全部收益流水并按类型汇总，规避单次请求 1000 条的截断问题
+    pub async fn get_income_summary(&self, start_time: u64, end_time: u64) -> Result<IncomeSummary, String> {
+        let mut summary = IncomeSummary::default();
+        let mut current_start = start_time;
+        let mut processed_ids = std::collections::HashSet::new();
+
+        loop {
+            let income_str = self.get_income_history(current_start, end_time).await
+                .map_err(|e| format!("拉取收益数据失败：{}", e))?;
+            let records: Vec<serde_json::Value> = serde_json::from_str(&income_str)
+                .map_err(|_| "解析币安收益数据失败。可能是查询跨度超出限制或数据异常。".to_string())?;
+            if records.is_empty() { break; }
+
+            let mut max_time = current_start;
+            let mut new_records = 0u32;
+
+            for r in &records {
+                let tran_id = r["tranId"].as_str().map(|s| s.to_string()).or_else(|| r["tranId"].as_u64().map(|v| v.to_string())).unwrap_or_default();
+                let income_type = r["incomeType"].as_str().unwrap_or("");
+                if !tran_id.is_empty() {
+                    // 同一笔成交的 REALIZED_PNL 与 COMMISSION 可能共用 tranId，去重键必须带上 incomeType
+                    if !processed_ids.insert(format!("{}:{}", tran_id, income_type)) {
+                        continue;
+                    }
+                }
+
+                new_records += 1;
+                let t = r["time"].as_u64().unwrap_or(0);
+                if t > max_time { max_time = t; }
+
+                let income = r["income"].as_str().and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
+                match income_type {
+                    "REALIZED_PNL" => {
+                        summary.realized_pnl += income;
+                        summary.trades_count += 1;
+                    }
+                    "COMMISSION" => summary.commission += income,
+                    "FUNDING_FEE" => summary.funding_fee += income,
+                    _ => {}
+                }
+            }
+
+            summary.records_processed += new_records;
+
+            if records.len() < 1000 || new_records == 0 {
+                break;
+            }
+            // 从最后一条的同一毫秒继续拉，确保不跳记录，重叠部分由去重兜底
+            current_start = max_time;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(summary)
     }
 
     pub async fn get_user_trades(&self, symbol: &str, limit: Option<u32>, start_time: Option<u64>) -> Result<String, reqwest::Error> {

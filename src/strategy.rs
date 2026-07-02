@@ -424,8 +424,8 @@ impl StrategyEngine {
             if self.tick_counter % 10 == 0 { // 约每1秒推送一次特征切片到 Redis
                 let ml_prob = crate::ml_engine::MLEngine::predict_win_rate(obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, "BUY", &self.mid_price_history);
                 let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                let feature_json = format!(r#"{{"sym":"{}","ts":{},"p":{:.4},"obi":{:.4},"buy_f":{:.4},"sell_f":{:.4},"fund":{:.4},"prob":{:.4}}}"#,
-                    self.position.symbol, timestamp, bid, obi, self.fast_buy_flow, self.fast_sell_flow, self.current_funding_rate, ml_prob);
+                let feature_json = format!(r#"{{"sym":"{}","ts":{},"p":{:.4},"ask":{:.4},"obi":{:.4},"buy_f":{:.4},"sell_f":{:.4},"sb_f":{:.4},"ss_f":{:.4},"fund":{:.6},"prob":{:.4}}}"#,
+                    self.position.symbol, timestamp, bid, ask, obi, self.fast_buy_flow, self.fast_sell_flow, self.slow_buy_flow, self.slow_sell_flow, self.current_funding_rate, ml_prob);
                 let _ = self.feature_tx.try_send(feature_json);
             }
 

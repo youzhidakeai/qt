@@ -2,3 +2,6 @@
 /logs
 .idea
 .env
+/research/data/
+/research/.venv/
+/feature_logs/
