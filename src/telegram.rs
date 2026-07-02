@@ -714,7 +714,8 @@ async fn answer(
                         <b>监护中的仓位:</b>\n{}",
                         if enabled == "1" { "✅ 开启" } else { "⛔️ 关闭" },
                         stop, alert,
-                        if ac == "0" { "关闭 (用 /guard autoclose <分钟> 开启)".to_string() } else { format!("{} 分钟", ac) },
+                        // HTML parse mode: 裸尖括号会被 Telegram 当非法标签拒收整条消息
+                        if ac == "0" { "关闭 (用 /guard autoclose &lt;分钟&gt; 开启)".to_string() } else { format!("{} 分钟", ac) },
                         pos_lines
                     )
                 }

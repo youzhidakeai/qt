@@ -62,15 +62,20 @@ if [ -d "research" ]; then
     sudo mkdir -p "$DEPLOY_DIR/research/data"
     sudo chmod +x "$DEPLOY_DIR/research/rerun.sh"
 
-    # 首次部署自动建 venv 并装依赖 (仅 pandas/numpy, 其余为标准库)
-    if [ ! -x "$DEPLOY_DIR/research/.venv/bin/python" ]; then
-        echo "📦 未发现 venv, 正在创建并安装依赖 (pandas numpy)..."
+    # 确保 venv 存在且依赖装全 (仅 pandas/numpy, 其余为标准库)
+    # 健康标准是 bin/pip 而非 bin/python: 系统缺 python3-venv 包时建出的
+    # 残缺 venv 有 python 没 pip, 这种直接删掉重建
+    if [ ! -x "$DEPLOY_DIR/research/.venv/bin/pip" ]; then
+        echo "📦 venv 缺失或残缺 (无 pip), 正在重建..."
+        sudo rm -rf "$DEPLOY_DIR/research/.venv"
         if ! sudo python3 -m venv "$DEPLOY_DIR/research/.venv"; then
             echo "❌ venv 创建失败, 请先执行: sudo apt install python3-venv"
             exit 1
         fi
-        sudo "$DEPLOY_DIR/research/.venv/bin/pip" install -q pandas numpy
     fi
+    # pip install 幂等: 已装全时秒过, 不能只在建 venv 时装 (venv 可能存在但依赖不全)
+    echo "📦 正在确保 Python 依赖 (pandas numpy)..."
+    sudo "$DEPLOY_DIR/research/.venv/bin/pip" install -q pandas numpy
     # 研究管线同样以 $SERVICE_USER 运行 (见 matrix-quant-research.service)
     sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEPLOY_DIR/research"
 
