@@ -179,13 +179,15 @@ impl BinanceExecutionClient {
         }
     }
 
-    // 挂交易所侧的整仓止损单 (STOP_MARKET + closePosition)，触发后市价平掉全部仓位，只减仓不开仓
+    // 挂交易所侧的整仓止损单 (STOP_MARKET + closePosition)，触发后市价平掉全部仓位，只减仓不开仓。
+    // 2025-12-09 起币安把条件单从 /fapi/v1/order 迁到 Algo Order API (旧端点报 -4120),
+    // 触发价字段也从 stopPrice 改名 triggerPrice。返回 algoId。
     pub async fn place_stop_market_close(&self, symbol: &str, side: &str, stop_price: &str) -> Result<u64, String> {
-        let endpoint = "/fapi/v1/order";
+        let endpoint = "/fapi/v1/algoOrder";
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
 
         let payload = format!(
-            "symbol={}&side={}&type=STOP_MARKET&closePosition=true&stopPrice={}&workingType=MARK_PRICE&recvWindow=60000&timestamp={}",
+            "algoType=CONDITIONAL&symbol={}&side={}&type=STOP_MARKET&closePosition=true&triggerPrice={}&workingType=MARK_PRICE&recvWindow=60000&timestamp={}",
             symbol, side, stop_price, timestamp
         );
         let signature = self.generate_signature(&payload);
@@ -201,9 +203,47 @@ impl BinanceExecutionClient {
         let text = res.text().await.map_err(|e| e.to_string())?;
         if status.is_success() {
             let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-            v["orderId"].as_u64().ok_or_else(|| format!("下单成功但无 orderId: {}", text))
+            v["algoId"].as_u64().ok_or_else(|| format!("下单成功但无 algoId: {}", text))
         } else {
             Err(format!("挂止损单失败: {}", text))
+        }
+    }
+
+    // 查询某交易对的全部在场条件单 (algo 单: 止损/止盈/追踪止损)
+    pub async fn get_open_algo_orders(&self, symbol: &str) -> Result<String, String> {
+        let endpoint = "/fapi/v1/openAlgoOrders";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let payload = format!("symbol={}&recvWindow=60000&timestamp={}", symbol, timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        res.text().await.map_err(|e| e.to_string())
+    }
+
+    // 撤销条件单 (algo 单), 按 algoId
+    pub async fn cancel_algo_order(&self, algo_id: u64) -> Result<(), String> {
+        let endpoint = "/fapi/v1/algoOrder";
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let payload = format!("algoId={}&recvWindow=60000&timestamp={}", algo_id, timestamp);
+        let signature = self.generate_signature(&payload);
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, payload, signature);
+
+        let res = self.client.delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            let text = res.text().await.unwrap_or_default();
+            Err(format!("撤销条件单失败: {}", text))
         }
     }
 

@@ -94,14 +94,14 @@ pub async fn run_guardian(
         for key in tracked {
             let sym = key.trim_start_matches("GUARD_OPENED_").to_string();
             if live.contains_key(&sym) { continue; }
-            if let Ok(orders_str) = exec.get_open_orders(&sym).await {
+            if let Ok(orders_str) = exec.get_open_algo_orders(&sym).await {
                 if let Ok(orders) = serde_json::from_str::<Vec<serde_json::Value>>(&orders_str) {
                     for o in orders {
                         let is_close_stop = o.get("closePosition").and_then(|v| v.as_bool()).unwrap_or(false)
-                            && o.get("origType").and_then(|v| v.as_str()).unwrap_or("") == "STOP_MARKET";
+                            && o.get("orderType").and_then(|v| v.as_str()).unwrap_or("") == "STOP_MARKET";
                         if is_close_stop {
-                            if let Some(oid) = o.get("orderId").and_then(|v| v.as_u64()) {
-                                let _ = exec.cancel_order(&sym, oid).await;
+                            if let Some(oid) = o.get("algoId").and_then(|v| v.as_u64()) {
+                                let _ = exec.cancel_algo_order(oid).await;
                                 info!("🛡 [{}] 仓位已平, 撤掉遗留止损挂单 #{}", sym, oid);
                             }
                         }
@@ -125,24 +125,24 @@ pub async fn run_guardian(
             let st = states.entry(sym.clone()).or_default();
             let is_long = amt > Decimal::ZERO;
 
-            // ---------- 1. 确保交易所侧止损单存在 ----------
-            match exec.get_open_orders(&sym).await {
+            // ---------- 1. 确保交易所侧止损单存在 (条件单在 algo 接口, 不在 openOrders) ----------
+            match exec.get_open_algo_orders(&sym).await {
                 Ok(orders_str) => {
                     let orders: Vec<serde_json::Value> = serde_json::from_str(&orders_str).unwrap_or_default();
                     let existing_stop = orders.iter().find(|o| {
                         o.get("closePosition").and_then(|v| v.as_bool()).unwrap_or(false)
-                            && o.get("origType").and_then(|v| v.as_str()).unwrap_or("") == "STOP_MARKET"
+                            && o.get("orderType").and_then(|v| v.as_str()).unwrap_or("") == "STOP_MARKET"
                     });
 
                     let mut place_new = false;
                     match existing_stop {
                         Some(o) => {
-                            let oid = o.get("orderId").and_then(|v| v.as_u64());
+                            let oid = o.get("algoId").and_then(|v| v.as_u64());
                             let is_ours = st.own_stop_id.is_some() && st.own_stop_id == oid;
                             // 只有我们自己挂的止损才跟随均价变化重挂 (比如加仓后均价漂移超 0.5%)
                             if is_ours && st.entry_used > Decimal::ZERO && ((entry - st.entry_used).abs() / entry) > dec!(0.005) {
                                 if let Some(oid) = oid {
-                                    if exec.cancel_order(&sym, oid).await.is_ok() {
+                                    if exec.cancel_algo_order(oid).await.is_ok() {
                                         st.own_stop_id = None;
                                         place_new = true;
                                     }
