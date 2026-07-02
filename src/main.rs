@@ -7,6 +7,7 @@ mod telegram;
 mod portfolio;
 mod ml_engine;
 mod guardian;
+mod paper;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -633,6 +634,15 @@ async fn main() {
     let ml_redis = redis_client.clone();
     tokio::spawn(async move {
         run_ml_hot_reload(ml_redis).await;
+    });
+
+    // ==========================================
+    // MODULE: 纸面交易引擎 (零实弹前向实测)
+    // ==========================================
+    let paper_redis = redis_client.clone();
+    let paper_tg = tg_tx.clone();
+    tokio::spawn(async move {
+        paper::run_paper_trader(paper_redis, paper_tg).await;
     });
 
     info!("矩阵核心系统正在运行中 (Matrix Engine Core Running)... 按 Ctrl+C 终止");

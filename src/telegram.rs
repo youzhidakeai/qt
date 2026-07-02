@@ -50,6 +50,8 @@ enum Command {
     History(String),
     #[command(description = "仓位保镖。用法: /guard status | on | off | stop &lt;百分比&gt; | alert &lt;分钟&gt; | autoclose &lt;分钟&gt;|off")]
     Guard(String),
+    #[command(description = "纸面交易引擎 (零实弹)。用法: /paper status | on | off | trail &lt;百分比&gt; | reset")]
+    Paper(String),
 }
 
 pub async fn run_telegram_bot(
@@ -756,6 +758,83 @@ async fn answer(
                     }
                 }
                 _ => "用法:\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 5 - 硬止损百分比\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
+            };
+            bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
+        }
+        Command::Paper(args) => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            let mut con = match redis::Client::open(redis_url).ok() {
+                Some(c) => match c.get_multiplexed_async_connection().await {
+                    Ok(con) => con,
+                    Err(e) => {
+                        bot.send_message(msg.chat.id, format!("❌ Redis 连接失败: {}", e)).await?;
+                        return Ok(());
+                    }
+                },
+                None => {
+                    bot.send_message(msg.chat.id, "❌ Redis 配置无效").await?;
+                    return Ok(());
+                }
+            };
+
+            let reply = match parts.as_slice() {
+                [] | ["status"] => {
+                    let enabled = redis::cmd("GET").arg("PAPER_ENABLED").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_else(|| "1".into());
+                    let trail = redis::cmd("GET").arg("PAPER_TRAIL_PCT").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_else(|| "3.0".into());
+                    let stats: crate::paper::PaperStats = redis::cmd("GET").arg("PAPER_STATS").query_async::<Option<String>>(&mut con).await.ok().flatten()
+                        .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                    let pos_keys: Vec<String> = redis::cmd("KEYS").arg("PAPER_POS_*").query_async(&mut con).await.unwrap_or_default();
+                    let mut pos_lines = String::new();
+                    for key in &pos_keys {
+                        if let Ok(Some(json)) = redis::cmd("GET").arg(key).query_async::<Option<String>>(&mut con).await {
+                            if let Ok(p) = serde_json::from_str::<crate::paper::PaperPos>(&json) {
+                                pos_lines.push_str(&format!("  • {} 入场 {:.6} | 最高 {:.6}\n", p.sym, p.entry, p.peak));
+                            }
+                        }
+                    }
+                    if pos_lines.is_empty() {
+                        pos_lines = "  (无)\n".to_string();
+                    }
+                    let pf = if stats.gross_loss > 0.0 { stats.gross_win / stats.gross_loss } else { 0.0 };
+                    format!(
+                        "📝 <b>纸面交易引擎</b> (零实弹前向实测)\n\n\
+                        开关: {} | 高点回撤线: {}%\n\n\
+                        📒 <b>账本:</b> {} 笔 | 胜率 {:.0}% | 盈利因子 {:.2}\n\
+                        累计净盈亏: <b>{:+.2}U</b> (虚拟)\n\n\
+                        <b>虚拟持仓:</b>\n{}\n\
+                        💡 实弹门槛: 数周后盈利因子 &gt; 1.3 且样本够大",
+                        if enabled == "1" { "✅ 运行中" } else { "⛔️ 已停" }, trail,
+                        stats.trades,
+                        if stats.trades > 0 { 100.0 * stats.wins as f64 / stats.trades as f64 } else { 0.0 },
+                        pf, stats.total_net, pos_lines)
+                }
+                ["on"] => {
+                    let _: () = redis::cmd("SET").arg("PAPER_ENABLED").arg("1").query_async(&mut con).await.unwrap_or(());
+                    "📝 纸面交易引擎已开启。".to_string()
+                }
+                ["off"] => {
+                    let _: () = redis::cmd("SET").arg("PAPER_ENABLED").arg("0").query_async(&mut con).await.unwrap_or(());
+                    "⛔️ 纸面交易引擎已暂停 (虚拟持仓保留, 恢复后继续跟踪)。".to_string()
+                }
+                ["trail", v] => {
+                    match v.parse::<f64>() {
+                        Ok(p) if (0.5..=20.0).contains(&p) => {
+                            let _: () = redis::cmd("SET").arg("PAPER_TRAIL_PCT").arg(v.to_string()).query_async(&mut con).await.unwrap_or(());
+                            format!("✅ 纸面高点回撤线已设为 {}%。注意: 改参数会让账本和回测基准不可比。", p)
+                        }
+                        _ => "❌ 无效参数, 范围 0.5 ~ 20。例: /paper trail 3".to_string(),
+                    }
+                }
+                ["reset"] => {
+                    let pos_keys: Vec<String> = redis::cmd("KEYS").arg("PAPER_POS_*").query_async(&mut con).await.unwrap_or_default();
+                    for key in pos_keys {
+                        let _: () = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap_or(());
+                    }
+                    let _: () = redis::cmd("DEL").arg("PAPER_STATS").query_async(&mut con).await.unwrap_or(());
+                    "🧹 纸面账本与虚拟持仓已清零, 重新开始记录。".to_string()
+                }
+                _ => "用法:\n/paper status - 账本与持仓\n/paper on|off - 开关\n/paper trail 3 - 回撤线百分比\n/paper reset - 清零账本".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }

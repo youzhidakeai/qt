@@ -1,0 +1,196 @@
+// ==========================================
+// MODULE: 纸面交易引擎 (Paper Trading)
+// 用回测中唯一不亏钱的配置 (dip 变体 / 3% 回撤 / 不加仓) 做前向实测:
+// 真实扫描 → 虚拟开仓 → 追踪高点回撤平仓 → Telegram 战报 + Redis 记账。
+// 不发送任何真实订单。实弹门槛: 纸面账本跑数周后盈利因子 > 1.3。
+// ==========================================
+use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc;
+use tracing::info;
+
+const NOTIONAL: f64 = 1500.0;      // 每仓虚拟名义 (与回测一致)
+const COST_RT: f64 = 0.003;        // 双边手续费+滑点 0.30% (与回测一致)
+const MAX_POS: usize = 2;
+const COOLDOWN_SECS: u64 = 3600;
+// 入场条件 = 回测 dip 变体 (research/backtest_pyramid.py)
+const V24_MIN: f64 = 150_000_000.0;
+const DIST_HIGH_MAX: f64 = -3.0;   // 距 24h 高点至少 -3%
+const RET60_MIN: f64 = 3.0;
+const RET15_MIN: f64 = 1.0;
+const RET5_MIN: f64 = 0.5;
+const VSURGE_MIN: f64 = 6.0;       // 5m 成交额 / 24h 平均 5m 成交额
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PaperPos {
+    pub sym: String,
+    pub entry: f64,
+    pub peak: f64,
+    pub opened_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct PaperStats {
+    pub total_net: f64,
+    pub gross_win: f64,
+    pub gross_loss: f64,
+    pub trades: u32,
+    pub wins: u32,
+}
+
+fn kf(k: &serde_json::Value, i: usize) -> f64 {
+    k.get(i).and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0.0)
+}
+
+async fn fetch_klines(http: &reqwest::Client, sym: &str, limit: u32) -> Option<Vec<serde_json::Value>> {
+    let url = format!("https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=1m&limit={}", sym, limit);
+    let v: serde_json::Value = http.get(&url).send().await.ok()?.json().await.ok()?;
+    v.as_array().cloned()
+}
+
+async fn load_stats(con: &mut redis::aio::MultiplexedConnection) -> PaperStats {
+    redis::cmd("GET").arg("PAPER_STATS").query_async::<Option<String>>(con).await.ok().flatten()
+        .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+async fn save_stats(con: &mut redis::aio::MultiplexedConnection, s: &PaperStats) {
+    if let Ok(json) = serde_json::to_string(s) {
+        let _: () = redis::cmd("SET").arg("PAPER_STATS").arg(json).query_async(con).await.unwrap_or(());
+    }
+}
+
+pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<String>) {
+    let http = reqwest::Client::new();
+    let mut cooldown: HashMap<String, std::time::Instant> = HashMap::new();
+    info!("📝 纸面交易引擎已启动 (dip变体/3%回撤/不加仓, 虚拟 {}U/仓, 零实弹)", NOTIONAL);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let mut con = match redis_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let enabled = redis::cmd("GET").arg("PAPER_ENABLED").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_else(|| "1".into());
+        if enabled != "1" {
+            continue;
+        }
+        let trail: f64 = redis::cmd("GET").arg("PAPER_TRAIL_PCT").query_async::<Option<String>>(&mut con).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(3.0);
+
+        // ---------- 1. 管理已开的虚拟仓位 ----------
+        let pos_keys: Vec<String> = redis::cmd("KEYS").arg("PAPER_POS_*").query_async(&mut con).await.unwrap_or_default();
+        let mut open_syms: Vec<String> = Vec::new();
+        for key in pos_keys {
+            let Some(json) = redis::cmd("GET").arg(&key).query_async::<Option<String>>(&mut con).await.ok().flatten() else { continue };
+            let Ok(mut p) = serde_json::from_str::<PaperPos>(&json) else {
+                let _: () = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap_or(());
+                continue;
+            };
+            // 用最后一根已收盘的 1m K线判断 (最后一个元素是进行中的, 丢弃)
+            let Some(kl) = fetch_klines(&http, &p.sym, 3).await else { open_syms.push(p.sym); continue };
+            if kl.len() >= 2 {
+                let bar = &kl[kl.len() - 2];
+                let (high, low) = (kf(bar, 2), kf(bar, 3));
+                let trail_px = p.peak * (1.0 - trail / 100.0);
+                if low <= trail_px && trail_px > 0.0 {
+                    // 悲观假设按回撤线成交
+                    let net = NOTIONAL * (trail_px / p.entry - 1.0) - NOTIONAL * COST_RT;
+                    let held_min = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 - p.opened_ms) / 60_000;
+                    let mut stats = load_stats(&mut con).await;
+                    stats.total_net += net;
+                    stats.trades += 1;
+                    if net > 0.0 { stats.wins += 1; stats.gross_win += net; } else { stats.gross_loss += net.abs(); }
+                    save_stats(&mut con, &stats).await;
+                    let _: () = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap_or(());
+                    cooldown.insert(p.sym.clone(), std::time::Instant::now());
+                    let emoji = if net > 0.0 { "🟢" } else { "🔴" };
+                    info!("📝 [纸面] {} 平仓 净{:+.1}U (账本累计 {:+.1}U)", p.sym, net, stats.total_net);
+                    let _ = tg_tx.send(format!(
+                        "📝 <b>【纸面平仓】</b> {} {}\n入场 {:.6} → 出场 {:.6} (高点回撤 {}%)\n持仓 {} 分钟 | 本单净: <b>{:+.2}U</b>\n\n📒 纸面账本: {} 笔 | 胜率 {:.0}% | 累计 <b>{:+.2}U</b>",
+                        emoji, p.sym, p.entry, trail_px, trail, held_min, net,
+                        stats.trades, if stats.trades > 0 { 100.0 * stats.wins as f64 / stats.trades as f64 } else { 0.0 }, stats.total_net)).await;
+                    continue;
+                }
+                if high > p.peak {
+                    p.peak = high;
+                    if let Ok(j) = serde_json::to_string(&p) {
+                        let _: () = redis::cmd("SET").arg(&key).arg(j).query_async(&mut con).await.unwrap_or(());
+                    }
+                }
+            }
+            open_syms.push(p.sym);
+        }
+
+        // ---------- 2. 扫描新的虚拟入场 ----------
+        if open_syms.len() >= MAX_POS {
+            continue;
+        }
+        let Ok(resp) = http.get("https://fapi.binance.com/fapi/v1/ticker/24hr").send().await else { continue };
+        let Ok(tickers) = resp.json::<serde_json::Value>().await else { continue };
+        let Some(arr) = tickers.as_array() else { continue };
+
+        // 预筛: 热点币 + 离 24h 高点有距离
+        let mut candidates: Vec<(String, f64, f64)> = Vec::new(); // (sym, v24, dist_high)
+        for t in arr {
+            let sym = t["symbol"].as_str().unwrap_or("");
+            if !sym.ends_with("USDT") || sym.contains('_') || sym.starts_with("XAU") || sym.starts_with("XAG") {
+                continue;
+            }
+            let v24: f64 = t["quoteVolume"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let last: f64 = t["lastPrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let high24: f64 = t["highPrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            if v24 < V24_MIN || last <= 0.0 || high24 <= 0.0 {
+                continue;
+            }
+            let dist = (last / high24 - 1.0) * 100.0;
+            if dist > DIST_HIGH_MAX {
+                continue;
+            }
+            if open_syms.contains(&sym.to_string()) {
+                continue;
+            }
+            if cooldown.get(sym).map(|t| t.elapsed().as_secs() < COOLDOWN_SECS).unwrap_or(false) {
+                continue;
+            }
+            candidates.push((sym.to_string(), v24, dist));
+        }
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.truncate(15); // 每轮最多细查 15 个, 控制请求量
+
+        let mut slots = MAX_POS - open_syms.len();
+        for (sym, v24, dist) in candidates {
+            if slots == 0 {
+                break;
+            }
+            let Some(kl) = fetch_klines(&http, &sym, 62).await else { continue };
+            if kl.len() < 62 {
+                continue;
+            }
+            let bars = &kl[..kl.len() - 1]; // 丢弃进行中的最后一根
+            let n = bars.len();
+            let c = |i: usize| kf(&bars[i], 4);
+            let last = c(n - 1);
+            if last <= 0.0 || c(n - 61) <= 0.0 {
+                continue;
+            }
+            let ret5 = (last / c(n - 6) - 1.0) * 100.0;
+            let ret15 = (last / c(n - 16) - 1.0) * 100.0;
+            let ret60 = (last / c(n - 61) - 1.0) * 100.0;
+            let vol5m: f64 = (n - 5..n).map(|i| kf(&bars[i], 7)).sum();
+            let vsurge = vol5m / (v24 / 288.0);
+
+            if ret60 >= RET60_MIN && ret15 >= RET15_MIN && ret5 >= RET5_MIN && vsurge >= VSURGE_MIN {
+                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                let pos = PaperPos { sym: sym.clone(), entry: last, peak: last, opened_ms: now_ms };
+                if let Ok(j) = serde_json::to_string(&pos) {
+                    let _: () = redis::cmd("SET").arg(format!("PAPER_POS_{}", sym)).arg(j).query_async(&mut con).await.unwrap_or(());
+                }
+                slots -= 1;
+                info!("📝 [纸面] {} 开仓 @ {} (1h {:+.1}% / 5m爆量 {:.1}x / 距高点 {:.1}%)", sym, last, ret60, vsurge, dist);
+                let _ = tg_tx.send(format!(
+                    "📝 <b>【纸面开仓】</b> {} (虚拟 {}U, 不是真单!)\n入场价: {:.6}\n信号: 1h {:+.1}% | 15m {:+.1}% | 爆量 {:.1}x | 距24h高点 {:.1}%\n出场规则: 高点回撤 {}% 自动了结",
+                    sym, NOTIONAL, last, ret60, ret15, vsurge, dist, trail)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+}
