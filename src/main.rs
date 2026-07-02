@@ -7,6 +7,7 @@ mod telegram;
 mod portfolio;
 mod ml_engine;
 mod guardian;
+mod funding;
 mod paper;
 
 use std::collections::HashMap;
@@ -647,6 +648,15 @@ async fn main() {
     let paper_tg = tg_tx.clone();
     tokio::spawn(async move {
         paper::run_paper_trader(paper_redis, paper_tg).await;
+    });
+
+    // ==========================================
+    // MODULE: 资金费率监控 (结构性收益侦察, 不下单)
+    // ==========================================
+    let funding_redis = redis_client.clone();
+    let funding_tg = tg_tx.clone();
+    tokio::spawn(async move {
+        funding::run_funding_monitor(funding_redis, funding_tg).await;
     });
 
     info!("矩阵核心系统正在运行中 (Matrix Engine Core Running)... 按 Ctrl+C 终止");
