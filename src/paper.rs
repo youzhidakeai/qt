@@ -134,11 +134,18 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             if kl.len() >= 2 {
                 let bar = &kl[kl.len() - 2];
                 let (high, low) = (kf(bar, 2), kf(bar, 3));
+                let held_min = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 - p.opened_ms) / 60_000;
                 let trail_px = p.peak * (1.0 - trail / 100.0);
-                if low <= trail_px && trail_px > 0.0 {
-                    // 悲观假设按回撤线成交
-                    let net = NOTIONAL * (trail_px / p.entry - 1.0) - NOTIONAL * COST_RT;
-                    let held_min = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 - p.opened_ms) / 60_000;
+                // 出场: ① 高点回撤触线 (悲观按线价成交) ② 24h 时间保险丝 (回测 MAX_HOLD 同口径)
+                let exit: Option<(f64, String)> = if low <= trail_px && trail_px > 0.0 {
+                    Some((trail_px, format!("高点回撤 {}%", trail)))
+                } else if held_min >= 1440 {
+                    Some((kf(bar, 4), "24h 时间保险丝".to_string()))
+                } else {
+                    None
+                };
+                if let Some((exit_px, reason)) = exit {
+                    let net = NOTIONAL * (exit_px / p.entry - 1.0) - NOTIONAL * COST_RT;
                     let mut stats = load_stats(&mut con).await;
                     stats.total_net += net;
                     stats.trades += 1;
@@ -147,11 +154,12 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
                     let _: () = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap_or(());
                     cooldown.insert(p.sym.clone(), std::time::Instant::now());
                     let emoji = if net > 0.0 { "🟢" } else { "🔴" };
+                    let pf = if stats.gross_loss > 0.0 { stats.gross_win / stats.gross_loss } else { 0.0 };
                     info!("📝 [纸面] {} 平仓 净{:+.1}U (账本累计 {:+.1}U)", p.sym, net, stats.total_net);
                     let _ = tg_tx.send(format!(
-                        "📝 <b>【纸面平仓】</b> {} {}\n入场 {:.6} → 出场 {:.6} (高点回撤 {}%)\n持仓 {} 分钟 | 本单净: <b>{:+.2}U</b>\n\n📒 纸面账本: {} 笔 | 胜率 {:.0}% | 累计 <b>{:+.2}U</b>",
-                        emoji, p.sym, p.entry, trail_px, trail, held_min, net,
-                        stats.trades, if stats.trades > 0 { 100.0 * stats.wins as f64 / stats.trades as f64 } else { 0.0 }, stats.total_net)).await;
+                        "📝 <b>【纸面平仓】</b> {} {}\n入场 {:.6} → 出场 {:.6} ({})\n持仓 {} 分钟 | 本单净: <b>{:+.2}U</b>\n\n📒 纸面账本: {} 笔 | 胜率 {:.0}% | 盈利因子 {:.2} | 累计 <b>{:+.2}U</b>",
+                        emoji, p.sym, p.entry, exit_px, reason, held_min, net,
+                        stats.trades, if stats.trades > 0 { 100.0 * stats.wins as f64 / stats.trades as f64 } else { 0.0 }, pf, stats.total_net)).await;
                     continue;
                 }
                 if high > p.peak {
