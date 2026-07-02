@@ -19,7 +19,10 @@ const DIST_HIGH_MAX: f64 = -3.0;   // 距 24h 高点至少 -3%
 const RET60_MIN: f64 = 3.0;
 const RET15_MIN: f64 = 1.0;
 const RET5_MIN: f64 = 0.5;
-const VSURGE_MIN: f64 = 6.0;       // 5m 成交额 / 24h 平均 5m 成交额
+// 爆量 = 最近 5m 成交额 / 过去 24h 滚动 5m 成交额的**中位数**。
+// 必须与 research/backtest_pyramid.py 的 vol_surge 口径一致 —— 曾误用均值分母,
+// 爆发币成交量右偏使均值远大于中位数, 同样行情只有 37% 能过线, 引擎几乎不开仓。
+const VSURGE_MIN: f64 = 6.0;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PaperPos {
@@ -62,6 +65,7 @@ async fn save_stats(con: &mut redis::aio::MultiplexedConnection, s: &PaperStats)
 pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<String>) {
     let http = reqwest::Client::new();
     let mut cooldown: HashMap<String, std::time::Instant> = HashMap::new();
+    let report_offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
     info!("📝 纸面交易引擎已启动 (dip变体/3%回撤/不加仓, 虚拟 {}U/仓, 零实弹)", NOTIONAL);
 
     loop {
@@ -71,6 +75,39 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             Err(_) => continue,
         };
         let enabled = redis::cmd("GET").arg("PAPER_ENABLED").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_else(|| "1".into());
+
+        // ---------- 0. 每日战报 (20点后第一个循环推送; 停用时也报, 作为心跳) ----------
+        // 去重状态放 Redis, 引擎重启不会重复推送
+        let now = time::OffsetDateTime::now_utc().to_offset(report_offset);
+        if now.hour() >= 20 {
+            let day = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
+            let reported = redis::cmd("GET").arg("PAPER_LAST_REPORT_DAY").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_default();
+            if reported != day {
+                let _: () = redis::cmd("SET").arg("PAPER_LAST_REPORT_DAY").arg(&day).query_async(&mut con).await.unwrap_or(());
+                let stats = load_stats(&mut con).await;
+                let open_count: usize = redis::cmd("KEYS").arg("PAPER_POS_*").query_async::<Vec<String>>(&mut con).await.map(|v| v.len()).unwrap_or(0);
+                let pf = if stats.gross_loss > 0.0 { stats.gross_win / stats.gross_loss } else { 0.0 };
+                let verdict = if stats.trades < 30 {
+                    format!("样本 {}/30 笔, 攒够前不下结论", stats.trades)
+                } else if pf > 1.3 {
+                    format!("盈利因子 {:.2} 已过 1.3 门槛, 可讨论小仓实弹", pf)
+                } else {
+                    format!("盈利因子 {:.2} 未达 1.3 门槛, 继续纸面", pf)
+                };
+                let _ = tg_tx.send(format!(
+                    "📝 <b>【纸面日报】</b> {}\n\n\
+                    状态: {} | 虚拟持仓: {} 个\n\
+                    📒 账本: {} 笔 | 胜率 {:.0}% | 盈利因子 {:.2}\n\
+                    累计净盈亏: <b>{:+.2}U</b> (虚拟)\n\n\
+                    ⚖️ 实弹判定: {}",
+                    day,
+                    if enabled == "1" { "✅ 运行中" } else { "⛔️ 已停" },
+                    open_count, stats.trades,
+                    if stats.trades > 0 { 100.0 * stats.wins as f64 / stats.trades as f64 } else { 0.0 },
+                    pf, stats.total_net, verdict)).await;
+            }
+        }
+
         if enabled != "1" {
             continue;
         }
@@ -129,7 +166,7 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
         let Some(arr) = tickers.as_array() else { continue };
 
         // 预筛: 热点币 + 离 24h 高点有距离
-        let mut candidates: Vec<(String, f64, f64)> = Vec::new(); // (sym, v24, dist_high)
+        let mut candidates: Vec<(String, f64, f64)> = Vec::new(); // (sym, change24, dist_high)
         for t in arr {
             let sym = t["symbol"].as_str().unwrap_or("");
             if !sym.ends_with("USDT") || sym.contains('_') || sym.starts_with("XAU") || sym.starts_with("XAG") {
@@ -138,6 +175,7 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             let v24: f64 = t["quoteVolume"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let last: f64 = t["lastPrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let high24: f64 = t["highPrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let change24: f64 = t["priceChangePercent"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             if v24 < V24_MIN || last <= 0.0 || high24 <= 0.0 {
                 continue;
             }
@@ -151,22 +189,25 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             if cooldown.get(sym).map(|t| t.elapsed().as_secs() < COOLDOWN_SECS).unwrap_or(false) {
                 continue;
             }
-            candidates.push((sym.to_string(), v24, dist));
+            candidates.push((sym.to_string(), change24, dist));
         }
+        // 按 24h 涨幅排序而非成交额: 之前按成交额排, BTC/ETH 等大币在回调日
+        // 永远占满名额却不可能满足 1h +3%, 真正拉升中的热点币反而查不到
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(15); // 每轮最多细查 15 个, 控制请求量
+        candidates.truncate(20); // 每轮最多细查 20 个, 控制请求量
 
         let mut slots = MAX_POS - open_syms.len();
-        for (sym, v24, dist) in candidates {
+        for (sym, _change24, dist) in candidates {
             if slots == 0 {
                 break;
             }
-            let Some(kl) = fetch_klines(&http, &sym, 62).await else { continue };
-            if kl.len() < 62 {
-                continue;
-            }
-            let bars = &kl[..kl.len() - 1]; // 丢弃进行中的最后一根
+            // 1500 根 1m: 61 根算动量, 其余算 24h 滚动 5m 成交额中位数 (回测同口径)
+            let Some(kl) = fetch_klines(&http, &sym, 1500).await else { continue };
+            let bars = &kl[..kl.len().saturating_sub(1)]; // 丢弃进行中的最后一根
             let n = bars.len();
+            if n < 292 {
+                continue; // 与回测 min_periods=288 对齐, 新上市数据不足不打
+            }
             let c = |i: usize| kf(&bars[i], 4);
             let last = c(n - 1);
             if last <= 0.0 || c(n - 61) <= 0.0 {
@@ -175,8 +216,28 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             let ret5 = (last / c(n - 6) - 1.0) * 100.0;
             let ret15 = (last / c(n - 16) - 1.0) * 100.0;
             let ret60 = (last / c(n - 61) - 1.0) * 100.0;
-            let vol5m: f64 = (n - 5..n).map(|i| kf(&bars[i], 7)).sum();
-            let vsurge = vol5m / (v24 / 288.0);
+            // 滚动 5m 成交额序列 (逐根滑动, 与 pandas rolling(5).sum() 一致)
+            let qv = |i: usize| kf(&bars[i], 7);
+            let mut v5s: Vec<f64> = Vec::with_capacity(n);
+            let mut acc = 0.0;
+            for i in 0..n {
+                acc += qv(i);
+                if i >= 5 {
+                    acc -= qv(i - 5);
+                }
+                if i >= 4 {
+                    v5s.push(acc);
+                }
+            }
+            let vol5m = *v5s.last().unwrap_or(&0.0);
+            let take = v5s.len().min(1440);
+            let mut window: Vec<f64> = v5s[v5s.len() - take..].to_vec();
+            window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = window[window.len() / 2];
+            if median <= 0.0 {
+                continue;
+            }
+            let vsurge = vol5m / median;
 
             if ret60 >= RET60_MIN && ret15 >= RET15_MIN && ret5 >= RET5_MIN && vsurge >= VSURGE_MIN {
                 let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
