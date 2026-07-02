@@ -141,6 +141,10 @@ async fn main() {
                             if let Some(mut w) = writer.take() {
                                 let _ = w.flush();
                             }
+                            // 目录可能被删或启动时创建失败，切换日志文件前兜底重建
+                            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                                tracing::error!("❌ 特征落盘目录创建失败: {} ({})", log_dir, e);
+                            }
                             let path = format!("{}/features_{}.jsonl", log_dir, day);
                             match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                                 Ok(f) => {
@@ -148,7 +152,7 @@ async fn main() {
                                     cur_day = day;
                                     tracing::info!("📼 特征录制器已切换到新文件: {}", path);
                                 }
-                                Err(e) => tracing::error!("❌ 特征落盘文件打开失败: {}", e),
+                                Err(e) => tracing::error!("❌ 特征落盘文件打开失败: {} ({})", path, e),
                             }
                         }
                         if let Some(w) = writer.as_mut() {
