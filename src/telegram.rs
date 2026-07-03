@@ -48,7 +48,7 @@ enum Command {
     Short(String),
     #[command(description = "查看近期历史仓位和成交记录。用法: /history [交易对] [天数]")]
     History(String),
-    #[command(description = "仓位保镖。用法: /guard status | on | off | stop &lt;百分比&gt; | alert &lt;分钟&gt; | autoclose &lt;分钟&gt;|off")]
+    #[command(description = "仓位保镖。用法: /guard status | on | off | stop &lt;百分比&gt; | trail &lt;激活%&gt; &lt;回撤%&gt; | alert &lt;分钟&gt; | autoclose &lt;分钟&gt;|off")]
     Guard(String),
     #[command(description = "纸面交易引擎 (零实弹)。用法: /paper status | on | off | trail &lt;百分比&gt; | reset")]
     Paper(String),
@@ -691,6 +691,9 @@ async fn answer(
                     let stop = get("GUARD_STOP_PCT", "5.0").await;
                     let alert = get("GUARD_HOLD_ALERT_MIN", "30").await;
                     let ac = get("GUARD_AUTO_CLOSE_MIN", "0").await;
+                    let trail_on = get("GUARD_TRAIL_ENABLED", "1").await;
+                    let trail_arm = get("GUARD_TRAIL_ARM_PCT", "3.5").await;
+                    let trail_pct = get("GUARD_TRAIL_PCT", "3.0").await;
                     let guarded: Vec<String> = redis::cmd("KEYS").arg("GUARD_OPENED_*").query_async(&mut con).await.unwrap_or_default();
                     let mut pos_lines = String::new();
                     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -709,11 +712,14 @@ async fn answer(
                         "🛡 <b>仓位保镖状态</b>\n\n\
                         开关: {}\n\
                         硬止损线: 开仓价 ±{}% (交易所侧 STOP_MARKET, 标记价格触发)\n\
+                        移动止盈: {}\n\
                         持仓超时提醒: {} 分钟\n\
                         超时自动平仓: {}\n\n\
                         <b>监护中的仓位:</b>\n{}",
                         if enabled == "1" { "✅ 开启" } else { "⛔️ 关闭" },
-                        stop, alert,
+                        stop,
+                        if trail_on == "1" { format!("✅ 浮盈 {}% 激活, 高点回撤 {}% 落袋", trail_arm, trail_pct) } else { "⛔️ 关闭".to_string() },
+                        alert,
                         // HTML parse mode: 裸尖括号会被 Telegram 当非法标签拒收整条消息
                         if ac == "0" { "关闭 (用 /guard autoclose &lt;分钟&gt; 开启)".to_string() } else { format!("{} 分钟", ac) },
                         pos_lines
@@ -745,6 +751,25 @@ async fn answer(
                         _ => "❌ 无效参数。例: /guard alert 30".to_string(),
                     }
                 }
+                ["trail", "off"] => {
+                    set(&mut con, "GUARD_TRAIL_ENABLED", "0".into()).await;
+                    "⛔️ 移动止盈已关闭, 只保留固定硬止损。".to_string()
+                }
+                ["trail", "on"] => {
+                    set(&mut con, "GUARD_TRAIL_ENABLED", "1".into()).await;
+                    "🔒 移动止盈已开启。".to_string()
+                }
+                ["trail", arm, pct] => {
+                    match (arm.parse::<f64>(), pct.parse::<f64>()) {
+                        (Ok(a), Ok(p)) if (0.5..=50.0).contains(&a) && (0.5..=20.0).contains(&p) && a > p => {
+                            set(&mut con, "GUARD_TRAIL_ARM_PCT", arm.to_string()).await;
+                            set(&mut con, "GUARD_TRAIL_PCT", pct.to_string()).await;
+                            set(&mut con, "GUARD_TRAIL_ENABLED", "1".into()).await;
+                            format!("🔒 移动止盈已设为: 浮盈 {}% 激活, 高点回撤 {}% 落袋。(激活线 &gt; 回撤保证激活后不会盈转亏)", a, p)
+                        }
+                        _ => "❌ 无效参数。要求: 激活% &gt; 回撤%, 例: /guard trail 3.5 3".to_string(),
+                    }
+                }
                 ["autoclose", "off"] | ["autoclose", "0"] => {
                     set(&mut con, "GUARD_AUTO_CLOSE_MIN", "0".into()).await;
                     "✅ 超时自动平仓已关闭，超时后只提醒不动手。".to_string()
@@ -758,7 +783,7 @@ async fn answer(
                         _ => "❌ 无效参数。例: /guard autoclose 60 或 /guard autoclose off".to_string(),
                     }
                 }
-                _ => "用法:\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 5 - 硬止损百分比\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
+                _ => "用法:\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 5 - 硬止损百分比\n/guard trail 3.5 3 - 移动止盈: 浮盈3.5%激活, 高点回撤3%落袋\n/guard trail on|off - 移动止盈开关\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }

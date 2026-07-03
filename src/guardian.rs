@@ -2,7 +2,9 @@
 // MODULE: 仓位保镖 (Position Guardian)
 // 每 10 秒扫描交易所全部真实仓位（含手动开的仓）:
 //   1. 没有止损保护的仓位 → 自动挂交易所侧 STOP_MARKET 整仓止损单
-//   2. 持仓超时 → Telegram 提醒 (可配置为自动市价平仓)
+//   2. 移动止盈: 浮盈过激活线后, 止损跟随最优标记价回撤 trail% 向有利方向棘轮,
+//      上不封顶, 高点回落自动落袋; 激活线 > trail 保证激活后不可能盈转亏
+//   3. 持仓超时 → Telegram 提醒 (可配置为自动市价平仓)
 // 本模块只会平仓和挂平仓单，不存在任何开仓路径。
 // ==========================================
 use std::collections::HashMap;
@@ -19,6 +21,12 @@ struct GuardState {
     // 我们自己挂的止损单 (用户手动挂的止损不归我们管，也绝不动它)
     own_stop_id: Option<u64>,
     entry_used: Decimal,
+    // 我们自己止损单的当前触发价 (棘轮基准)
+    stop_price: Decimal,
+    // 持仓期最优标记价: 多单为最高价, 空单为最低价
+    peak: Decimal,
+    // 移动止盈是否已激活 (浮盈达到激活线后为 true, 之后止损只上移不下移)
+    trail_armed: bool,
     last_hold_alert_min: u64,
     stop_error_notified: bool,
     auto_close_attempted: bool,
@@ -26,7 +34,7 @@ struct GuardState {
 
 impl Default for GuardState {
     fn default() -> Self {
-        Self { own_stop_id: None, entry_used: Decimal::ZERO, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
+        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
     }
 }
 
@@ -71,6 +79,11 @@ pub async fn run_guardian(
         let stop_pct = Decimal::from_str(&read_cfg(&mut con, "GUARD_STOP_PCT", "5.0").await).unwrap_or(dec!(5.0));
         let alert_min: u64 = read_cfg(&mut con, "GUARD_HOLD_ALERT_MIN", "30").await.parse().unwrap_or(30);
         let auto_close_min: u64 = read_cfg(&mut con, "GUARD_AUTO_CLOSE_MIN", "0").await.parse().unwrap_or(0);
+        // 移动止盈: 浮盈达到激活线后, 止损跟随持仓期最优价回撤 trail% 并只朝有利方向棘轮。
+        // 激活线 > 回撤幅度, 保证激活后的仓位数学上不可能盈转亏。
+        let trail_on = read_cfg(&mut con, "GUARD_TRAIL_ENABLED", "1").await == "1";
+        let trail_arm = Decimal::from_str(&read_cfg(&mut con, "GUARD_TRAIL_ARM_PCT", "3.5").await).unwrap_or(dec!(3.5));
+        let trail_pct = Decimal::from_str(&read_cfg(&mut con, "GUARD_TRAIL_PCT", "3.0").await).unwrap_or(dec!(3.0));
 
         let pos_str = match exec.check_positions().await {
             Ok(s) => s,
@@ -78,15 +91,16 @@ pub async fn run_guardian(
         };
         let positions: Vec<serde_json::Value> = serde_json::from_str(&pos_str).unwrap_or_default();
 
-        // sym -> (数量, 开仓均价, 未实现盈亏)
-        let mut live: HashMap<String, (Decimal, Decimal, Decimal)> = HashMap::new();
+        // sym -> (数量, 开仓均价, 未实现盈亏, 标记价格)
+        let mut live: HashMap<String, (Decimal, Decimal, Decimal, Decimal)> = HashMap::new();
         for pos in &positions {
             let amt = pos.get("positionAmt").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
             if amt == Decimal::ZERO { continue; }
             let sym = pos.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let entry = pos.get("entryPrice").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
             let upnl = pos.get("unRealizedProfit").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
-            live.insert(sym, (amt, entry, upnl));
+            let mark = pos.get("markPrice").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
+            live.insert(sym, (amt, entry, upnl, mark));
         }
 
         // ---------- 已平仓位的善后: 撤掉遗留的整仓止损单, 清除计时 ----------
@@ -113,7 +127,7 @@ pub async fn run_guardian(
         }
 
         // ---------- 在场仓位巡逻 ----------
-        for (sym, (amt, entry, upnl)) in live {
+        for (sym, (amt, entry, upnl, mark)) in live {
             if entry <= Decimal::ZERO { continue; }
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
             let opened_key = format!("GUARD_OPENED_{}", sym);
@@ -125,6 +139,24 @@ pub async fn run_guardian(
             let st = states.entry(sym.clone()).or_default();
             let is_long = amt > Decimal::ZERO;
 
+            // ---------- 0. 移动止盈: 跟踪最优价, 浮盈过激活线后武装 ----------
+            if mark > Decimal::ZERO {
+                if st.peak <= Decimal::ZERO {
+                    st.peak = if is_long { mark.max(entry) } else { mark.min(entry) };
+                } else {
+                    st.peak = if is_long { st.peak.max(mark) } else { st.peak.min(mark) };
+                }
+                let profit_pct = if is_long { (mark - entry) / entry * dec!(100) } else { (entry - mark) / entry * dec!(100) };
+                if trail_on && !st.trail_armed && profit_pct >= trail_arm {
+                    st.trail_armed = true;
+                    let floor_px = if is_long { st.peak * (Decimal::ONE - trail_pct / dec!(100)) } else { st.peak * (Decimal::ONE + trail_pct / dec!(100)) };
+                    info!("🔒 [{}] 移动止盈已激活 (浮盈 {:.2}%), 从最优价回撤 {}% 落袋", sym, profit_pct, trail_pct);
+                    let _ = tg_tx.send(format!(
+                        "🔒 <b>【移动止盈已激活】</b> {}\n\n当前浮盈: <b>{:.2}%</b> (已过激活线 {}%)\n从此上不封顶: 止损将跟随最高点上移, 从最优价回撤 {}% 自动落袋\n当前保底出场价: <b>{}</b> (盈转亏已不可能)",
+                        sym, profit_pct, trail_arm, trail_pct, floor_px.round_dp(6).normalize())).await;
+                }
+            }
+
             // ---------- 1. 确保交易所侧止损单存在 (条件单在 algo 接口, 不在 openOrders) ----------
             match exec.get_open_algo_orders(&sym).await {
                 Ok(orders_str) => {
@@ -134,17 +166,46 @@ pub async fn run_guardian(
                             && o.get("orderType").and_then(|v| v.as_str()).unwrap_or("") == "STOP_MARKET"
                     });
 
+                    // 期望止损价: 灾难线 (基于均价) 与移动止盈线 (基于最优价) 取对我们更有利者
+                    let disaster = if is_long {
+                        entry * (Decimal::ONE - stop_pct / dec!(100))
+                    } else {
+                        entry * (Decimal::ONE + stop_pct / dec!(100))
+                    };
+                    let raw_desired = if trail_on && st.trail_armed {
+                        let trail_line = if is_long {
+                            st.peak * (Decimal::ONE - trail_pct / dec!(100))
+                        } else {
+                            st.peak * (Decimal::ONE + trail_pct / dec!(100))
+                        };
+                        if is_long { disaster.max(trail_line) } else { disaster.min(trail_line) }
+                    } else {
+                        disaster
+                    };
+                    let tick = exchange_info.get(&sym).map(|i| i.tick_size);
+                    let desired_px = align_to_tick(raw_desired, tick, is_long);
+
                     let mut place_new = false;
                     match existing_stop {
                         Some(o) => {
                             let oid = o.get("algoId").and_then(|v| v.as_u64());
                             let is_ours = st.own_stop_id.is_some() && st.own_stop_id == oid;
-                            // 只有我们自己挂的止损才跟随均价变化重挂 (比如加仓后均价漂移超 0.5%)
-                            if is_ours && st.entry_used > Decimal::ZERO && ((entry - st.entry_used).abs() / entry) > dec!(0.005) {
-                                if let Some(oid) = oid {
-                                    if exec.cancel_algo_order(oid).await.is_ok() {
-                                        st.own_stop_id = None;
-                                        place_new = true;
+                            if is_ours {
+                                // 重挂条件: ① 移动止盈棘轮上移超 0.1% (只朝有利方向)
+                                //          ② 未激活时均价漂移超 0.5% (如加仓后)
+                                let improved = st.stop_price > Decimal::ZERO && if is_long {
+                                    desired_px > st.stop_price * dec!(1.001)
+                                } else {
+                                    desired_px < st.stop_price * dec!(0.999)
+                                };
+                                let drifted = !st.trail_armed && st.entry_used > Decimal::ZERO
+                                    && ((entry - st.entry_used).abs() / entry) > dec!(0.005);
+                                if improved || drifted {
+                                    if let Some(oid) = oid {
+                                        if exec.cancel_algo_order(oid).await.is_ok() {
+                                            st.own_stop_id = None;
+                                            place_new = true;
+                                        }
                                     }
                                 }
                             }
@@ -153,23 +214,25 @@ pub async fn run_guardian(
                     }
 
                     if place_new {
-                        let (side, raw_stop) = if is_long {
-                            ("SELL", entry * (Decimal::ONE - stop_pct / dec!(100)))
-                        } else {
-                            ("BUY", entry * (Decimal::ONE + stop_pct / dec!(100)))
-                        };
-                        let tick = exchange_info.get(&sym).map(|i| i.tick_size);
-                        let stop_px = align_to_tick(raw_stop, tick, is_long);
+                        let side = if is_long { "SELL" } else { "BUY" };
+                        let stop_px = desired_px;
                         let stop_str = stop_px.normalize().to_string();
                         match exec.place_stop_market_close(&sym, side, &stop_str).await {
                             Ok(oid) => {
                                 st.own_stop_id = Some(oid);
                                 st.entry_used = entry;
+                                st.stop_price = stop_px;
                                 st.stop_error_notified = false;
-                                // 触发时的预计亏损 = 仓位数量 × |均价 - 止损价| (市价成交, 滑点另计)
-                                let est_loss = (amt.abs() * (entry - stop_px).abs()).round_dp(2).normalize();
-                                info!("🛡 [{}] 已挂交易所侧硬止损 @ {} (均价 {}, -{}%, 预计亏损 {}U)", sym, stop_str, entry.normalize(), stop_pct, est_loss);
-                                let _ = tg_tx.send(format!("🛡 <b>【保镖已就位】</b>\n\n交易对: {}\n方向: {}\n开仓均价: {}\n硬止损已挂在交易所: <b>{}</b> (-{}%)\n触发预计亏损: <b>-{} U</b> (不含滑点)\n\n即使引擎断电, 这张止损单也会由币安执行, 强平不可能发生。", sym, if is_long { "🟢 多" } else { "🔴 空" }, entry.round_dp(6).normalize(), stop_str, stop_pct, est_loss)).await;
+                                if st.trail_armed {
+                                    // 棘轮上移只写日志, 不刷 TG (拉升时可能每 10 秒动一次)
+                                    let locked = (amt.abs() * (stop_px - entry) * if is_long { Decimal::ONE } else { dec!(-1) }).round_dp(2).normalize();
+                                    info!("🔒 [{}] 止盈棘轮上移 @ {} (锁定盈亏 {:+}U)", sym, stop_str, locked);
+                                } else {
+                                    // 触发时的预计亏损 = 仓位数量 × |均价 - 止损价| (市价成交, 滑点另计)
+                                    let est_loss = (amt.abs() * (entry - stop_px).abs()).round_dp(2).normalize();
+                                    info!("🛡 [{}] 已挂交易所侧硬止损 @ {} (均价 {}, -{}%, 预计亏损 {}U)", sym, stop_str, entry.normalize(), stop_pct, est_loss);
+                                    let _ = tg_tx.send(format!("🛡 <b>【保镖已就位】</b>\n\n交易对: {}\n方向: {}\n开仓均价: {}\n硬止损已挂在交易所: <b>{}</b> (-{}%)\n触发预计亏损: <b>-{} U</b> (不含滑点)\n浮盈过 {}% 后自动切换移动止盈模式\n\n即使引擎断电, 这张止损单也会由币安执行, 强平不可能发生。", sym, if is_long { "🟢 多" } else { "🔴 空" }, entry.round_dp(6).normalize(), stop_str, stop_pct, est_loss, trail_arm)).await;
+                                }
                             }
                             Err(e) => {
                                 error!("🛡 [{}] 挂硬止损失败: {}", sym, e);
