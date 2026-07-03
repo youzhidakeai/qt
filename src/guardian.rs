@@ -166,8 +166,10 @@ pub async fn run_guardian(
                                 st.own_stop_id = Some(oid);
                                 st.entry_used = entry;
                                 st.stop_error_notified = false;
-                                info!("🛡 [{}] 已挂交易所侧硬止损 @ {} (均价 {}, -{}%)", sym, stop_str, entry.normalize(), stop_pct);
-                                let _ = tg_tx.send(format!("🛡 <b>【保镖已就位】</b>\n\n交易对: {}\n方向: {}\n开仓均价: {}\n硬止损已挂在交易所: <b>{}</b> (-{}%)\n\n即使引擎断电, 这张止损单也会由币安执行, 强平不可能发生。", sym, if is_long { "🟢 多" } else { "🔴 空" }, entry.round_dp(6).normalize(), stop_str, stop_pct)).await;
+                                // 触发时的预计亏损 = 仓位数量 × |均价 - 止损价| (市价成交, 滑点另计)
+                                let est_loss = (amt.abs() * (entry - stop_px).abs()).round_dp(2).normalize();
+                                info!("🛡 [{}] 已挂交易所侧硬止损 @ {} (均价 {}, -{}%, 预计亏损 {}U)", sym, stop_str, entry.normalize(), stop_pct, est_loss);
+                                let _ = tg_tx.send(format!("🛡 <b>【保镖已就位】</b>\n\n交易对: {}\n方向: {}\n开仓均价: {}\n硬止损已挂在交易所: <b>{}</b> (-{}%)\n触发预计亏损: <b>-{} U</b> (不含滑点)\n\n即使引擎断电, 这张止损单也会由币安执行, 强平不可能发生。", sym, if is_long { "🟢 多" } else { "🔴 空" }, entry.round_dp(6).normalize(), stop_str, stop_pct, est_loss)).await;
                             }
                             Err(e) => {
                                 error!("🛡 [{}] 挂硬止损失败: {}", sym, e);

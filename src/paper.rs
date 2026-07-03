@@ -138,7 +138,8 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
                 let trail_px = p.peak * (1.0 - trail / 100.0);
                 // 出场: ① 高点回撤触线 (悲观按线价成交) ② 24h 时间保险丝 (回测 MAX_HOLD 同口径)
                 let exit: Option<(f64, String)> = if low <= trail_px && trail_px > 0.0 {
-                    Some((trail_px, format!("高点回撤 {}%", trail)))
+                    // 跳空低开砸穿线时按开盘价成交 (回测同口径), 不许按线价美化
+                    Some((trail_px.min(kf(bar, 1)), format!("高点回撤 {}%", trail)))
                 } else if held_min >= 1440 {
                     Some((kf(bar, 4), "24h 时间保险丝".to_string()))
                 } else {
@@ -255,16 +256,20 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             let vsurge = vol5m / median;
 
             if ret60 >= RET60_MIN && ret15 >= RET15_MIN && ret5 >= RET5_MIN && vsurge >= VSURGE_MIN {
+                // 入场价用进行中那根 K 的最新价 (≈此刻市价单能成交的价), 不用已收盘的
+                // "过期价"——拉升行情里旧收盘价系统性偏低, 会虚增账本利润
+                let live_px = kf(&kl[kl.len() - 1], 4);
+                let entry_px = if live_px > 0.0 { live_px } else { last };
                 let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                let pos = PaperPos { sym: sym.clone(), entry: last, peak: last, opened_ms: now_ms };
+                let pos = PaperPos { sym: sym.clone(), entry: entry_px, peak: entry_px, opened_ms: now_ms };
                 if let Ok(j) = serde_json::to_string(&pos) {
                     let _: () = redis::cmd("SET").arg(format!("PAPER_POS_{}", sym)).arg(j).query_async(&mut con).await.unwrap_or(());
                 }
                 slots -= 1;
-                info!("📝 [纸面] {} 开仓 @ {} (1h {:+.1}% / 5m爆量 {:.1}x / 距高点 {:.1}%)", sym, last, ret60, vsurge, dist);
+                info!("📝 [纸面] {} 开仓 @ {} (1h {:+.1}% / 5m爆量 {:.1}x / 距高点 {:.1}%)", sym, entry_px, ret60, vsurge, dist);
                 let _ = tg_tx.send(format!(
                     "📝 <b>【纸面开仓】</b> {} (虚拟 {}U, 不是真单!)\n入场价: {:.6}\n信号: 1h {:+.1}% | 15m {:+.1}% | 爆量 {:.1}x | 距24h高点 {:.1}%\n出场规则: 高点回撤 {}% 自动了结",
-                    sym, NOTIONAL, last, ret60, ret15, vsurge, dist, trail)).await;
+                    sym, NOTIONAL, entry_px, ret60, ret15, vsurge, dist, trail)).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
