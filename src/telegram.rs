@@ -688,12 +688,12 @@ async fn answer(
                         }
                     };
                     let enabled = get("GUARD_ENABLED", "1").await;
-                    let stop = get("GUARD_STOP_PCT", "5.0").await;
+                    let stop = get("GUARD_STOP_ROE", "50").await;
                     let alert = get("GUARD_HOLD_ALERT_MIN", "30").await;
                     let ac = get("GUARD_AUTO_CLOSE_MIN", "0").await;
                     let trail_on = get("GUARD_TRAIL_ENABLED", "1").await;
-                    let trail_arm = get("GUARD_TRAIL_ARM_PCT", "3.5").await;
-                    let trail_pct = get("GUARD_TRAIL_PCT", "3.0").await;
+                    let trail_arm = get("GUARD_TRAIL_ARM_ROE", "20").await;
+                    let trail_pct = get("GUARD_TRAIL_ROE", "15").await;
                     let guarded: Vec<String> = redis::cmd("KEYS").arg("GUARD_OPENED_*").query_async(&mut con).await.unwrap_or_default();
                     let mut pos_lines = String::new();
                     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -711,14 +711,14 @@ async fn answer(
                     format!(
                         "🛡 <b>仓位保镖状态</b>\n\n\
                         开关: {}\n\
-                        硬止损线: 开仓价 ±{}% (交易所侧 STOP_MARKET, 标记价格触发)\n\
+                        硬止损线: ROE -{}% (按各仓位杠杆折算币价, 交易所侧标记价格触发)\n\
                         移动止盈: {}\n\
                         持仓超时提醒: {} 分钟\n\
                         超时自动平仓: {}\n\n\
                         <b>监护中的仓位:</b>\n{}",
                         if enabled == "1" { "✅ 开启" } else { "⛔️ 关闭" },
                         stop,
-                        if trail_on == "1" { format!("✅ 浮盈 {}% 激活, 高点回撤 {}% 落袋", trail_arm, trail_pct) } else { "⛔️ 关闭".to_string() },
+                        if trail_on == "1" { format!("✅ ROE +{}% 激活, 峰值回吐 ROE {}% 落袋", trail_arm, trail_pct) } else { "⛔️ 关闭".to_string() },
                         alert,
                         // HTML parse mode: 裸尖括号会被 Telegram 当非法标签拒收整条消息
                         if ac == "0" { "关闭 (用 /guard autoclose &lt;分钟&gt; 开启)".to_string() } else { format!("{} 分钟", ac) },
@@ -735,11 +735,11 @@ async fn answer(
                 }
                 ["stop", v] => {
                     match v.parse::<f64>() {
-                        Ok(p) if (0.5..=50.0).contains(&p) => {
-                            set(&mut con, "GUARD_STOP_PCT", v.to_string()).await;
-                            format!("✅ 硬止损线已设为开仓价 ±{}%。已挂的止损单在均价漂移后会自动按新参数重挂，或平仓后对新仓生效。", p)
+                        Ok(p) if (5.0..=90.0).contains(&p) => {
+                            set(&mut con, "GUARD_STOP_ROE", v.to_string()).await;
+                            format!("✅ 硬止损线已设为 ROE -{}% (按各仓位杠杆折算币价, 10x 时 = 币价 -{:.1}%)。已挂的止损单在均价漂移后会自动按新参数重挂，或平仓后对新仓生效。", p, p / 10.0)
                         }
-                        _ => "❌ 无效参数，范围 0.5 ~ 50 (百分比)。例: /guard stop 5".to_string(),
+                        _ => "❌ 无效参数，范围 5 ~ 90 (ROE 百分比)。例: /guard stop 50".to_string(),
                     }
                 }
                 ["alert", v] => {
@@ -761,13 +761,13 @@ async fn answer(
                 }
                 ["trail", arm, pct] => {
                     match (arm.parse::<f64>(), pct.parse::<f64>()) {
-                        (Ok(a), Ok(p)) if (0.5..=50.0).contains(&a) && (0.5..=20.0).contains(&p) && a > p => {
-                            set(&mut con, "GUARD_TRAIL_ARM_PCT", arm.to_string()).await;
-                            set(&mut con, "GUARD_TRAIL_PCT", pct.to_string()).await;
+                        (Ok(a), Ok(p)) if (2.0..=300.0).contains(&a) && (1.0..=100.0).contains(&p) && a > p => {
+                            set(&mut con, "GUARD_TRAIL_ARM_ROE", arm.to_string()).await;
+                            set(&mut con, "GUARD_TRAIL_ROE", pct.to_string()).await;
                             set(&mut con, "GUARD_TRAIL_ENABLED", "1".into()).await;
-                            format!("🔒 移动止盈已设为: 浮盈 {}% 激活, 高点回撤 {}% 落袋。(激活线 &gt; 回撤保证激活后不会盈转亏)", a, p)
+                            format!("🔒 移动止盈已设为: ROE +{}% 激活, 峰值回吐 ROE {}% 落袋 (按各仓位杠杆自动折算币价)。激活 &gt; 回吐保证激活后不会盈转亏。", a, p)
                         }
-                        _ => "❌ 无效参数。要求: 激活% &gt; 回撤%, 例: /guard trail 3.5 3".to_string(),
+                        _ => "❌ 无效参数 (ROE 百分比)。要求: 激活 &gt; 回吐, 例: /guard trail 20 15".to_string(),
                     }
                 }
                 ["autoclose", "off"] | ["autoclose", "0"] => {
@@ -783,7 +783,7 @@ async fn answer(
                         _ => "❌ 无效参数。例: /guard autoclose 60 或 /guard autoclose off".to_string(),
                     }
                 }
-                _ => "用法:\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 5 - 硬止损百分比\n/guard trail 3.5 3 - 移动止盈: 浮盈3.5%激活, 高点回撤3%落袋\n/guard trail on|off - 移动止盈开关\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
+                _ => "用法 (百分比一律按 ROE, 即 App 显示的收益率):\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 50 - 硬止损 ROE -50%\n/guard trail 20 15 - 移动止盈: ROE +20% 激活, 峰值回吐 15% 落袋\n/guard trail on|off - 移动止盈开关\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
