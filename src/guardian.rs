@@ -127,6 +127,34 @@ pub async fn run_guardian(
                     }
                 }
             }
+            // 仓位了结战报: 无论是手动平、止损还是移动止盈成交, 都汇报已实现盈亏
+            let opened_at: u64 = redis::cmd("GET").arg(&key).query_async::<Option<String>>(&mut con).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            if opened_at > 0 {
+                if let Ok(income_str) = exec.get_income_history(opened_at, now_ms).await {
+                    if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&income_str) {
+                        let mut realized = Decimal::ZERO;
+                        let mut fee_usdt = Decimal::ZERO;
+                        for it in items.iter().filter(|it| it.get("symbol").and_then(|v| v.as_str()) == Some(&sym)) {
+                            let val = it.get("income").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok()).unwrap_or(Decimal::ZERO);
+                            match it.get("incomeType").and_then(|v| v.as_str()).unwrap_or("") {
+                                "REALIZED_PNL" => realized += val,
+                                "COMMISSION" if it.get("asset").and_then(|v| v.as_str()) == Some("USDT") => fee_usdt += val,
+                                _ => {}
+                            }
+                        }
+                        let held_min = now_ms.saturating_sub(opened_at) / 60_000;
+                        let emoji = if realized >= Decimal::ZERO { "🟢" } else { "🔴" };
+                        let was_armed = states.get(&sym).map(|s| s.trail_armed).unwrap_or(false);
+                        let how = if was_armed { "移动止盈/手动" } else { "止损/手动" };
+                        let _ = tg_tx.send(format!(
+                            "🔓 <b>【仓位已了结】</b> {} {}\n持仓 {} 分钟 | 已实现盈亏: <b>{:+.2} U</b>{}\n出场方式: {} (交易所侧成交或手动)",
+                            emoji, sym, held_min, realized.round_dp(2).normalize(),
+                            if fee_usdt != Decimal::ZERO { format!(" (含USDT手续费 {:.2})", fee_usdt.round_dp(2)) } else { String::new() },
+                            how)).await;
+                    }
+                }
+            }
             let _: () = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap_or(());
             states.remove(&sym);
         }
