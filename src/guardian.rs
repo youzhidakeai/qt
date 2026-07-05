@@ -29,6 +29,8 @@ struct GuardState {
     peak: Decimal,
     // 移动止盈是否已激活 (浮盈达到激活线后为 true, 之后止损只上移不下移)
     trail_armed: bool,
+    // 已播报过的最高 ROE 里程碑 (只升不降, 防止反复提醒同一档)
+    last_milestone_roe: i32,
     last_hold_alert_min: u64,
     stop_error_notified: bool,
     auto_close_attempted: bool,
@@ -36,9 +38,12 @@ struct GuardState {
 
 impl Default for GuardState {
     fn default() -> Self {
-        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
+        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
     }
 }
+
+// ROE 里程碑播报档位 (与旧版 strategy.rs 的暴涨通知同档, 现由保镖统一收编)
+const ROE_MILESTONES: [i32; 8] = [10, 15, 20, 25, 30, 40, 50, 100];
 
 async fn read_cfg(con: &mut redis::aio::MultiplexedConnection, key: &str, default: &str) -> String {
     redis::cmd("GET").arg(key).query_async::<Option<String>>(con).await.ok().flatten().unwrap_or_else(|| default.to_string())
@@ -184,6 +189,18 @@ pub async fn run_guardian(
                 } else {
                     st.peak = if is_long { st.peak.max(mark) } else { st.peak.min(mark) };
                 }
+                // ROE 里程碑播报: 用 peak (只升不降) 而非当前 mark, 语义是"曾经到过", 不随价格回落取消
+                let peak_roe = if is_long { (st.peak - entry) / entry * dec!(100) * lev } else { (entry - st.peak) / entry * dec!(100) * lev };
+                for &lvl in ROE_MILESTONES.iter() {
+                    if peak_roe >= Decimal::from(lvl) && st.last_milestone_roe < lvl {
+                        st.last_milestone_roe = lvl;
+                        info!("🚀 [{}] 浮盈突破 ROE +{}% (峰值 {:+}%)", sym, lvl, peak_roe.round_dp(1));
+                        let _ = tg_tx.send(format!(
+                            "🚀 <b>【浮盈里程碑】</b> {} {} ({}x)\n\n峰值 ROE 已突破: <b>+{}%</b>\n持仓量: {} | 均价: {}",
+                            sym, if is_long { "🟢 多" } else { "🔴 空" }, lev, lvl, amt.abs().normalize(), entry.round_dp(6).normalize())).await;
+                    }
+                }
+
                 let profit_pct = if is_long { (mark - entry) / entry * dec!(100) } else { (entry - mark) / entry * dec!(100) };
                 if trail_on && !st.trail_armed && profit_pct >= trail_arm {
                     st.trail_armed = true;
