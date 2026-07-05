@@ -3,6 +3,10 @@
 // 用回测中唯一不亏钱的配置 (dip 变体 / 3% 回撤 / 不加仓) 做前向实测:
 // 真实扫描 → 虚拟开仓 → 追踪高点回撤平仓 → Telegram 战报 + Redis 记账。
 // 不发送任何真实订单。实弹门槛: 纸面账本跑数周后盈利因子 > 1.3。
+//
+// v2 (2026-07-04): 加资金费率过滤。v1 无过滤跑了 40 笔 PF 1.01, 与回测 1.02
+// 一致 = 打平判死。回测按入场时费率分桶: 负费率(死猫跳) PF 0.40 / 基线 0~11%
+// PF 1.81 / 偏热 >11% 全灭 → 只在费率年化 [0, 30%] 区间入场 (research/funding_vs_dip.py)。
 // ==========================================
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
@@ -23,6 +27,11 @@ const RET5_MIN: f64 = 0.5;
 // 必须与 research/backtest_pyramid.py 的 vol_surge 口径一致 —— 曾误用均值分母,
 // 爆发币成交量右偏使均值远大于中位数, 同样行情只有 37% 能过线, 引擎几乎不开仓。
 const VSURGE_MIN: f64 = 6.0;
+// v2: 入场时该币资金费率年化必须落在此区间 (research/funding_vs_dip.py):
+// 负费率(死猫跳) PF 0.40 排除; 基线 0~11% PF 1.81 最佳; >11% 偏热样本小但全灭,
+// 上限放宽到 30% 留出安全边际, 但绝不进入 >50% 的过热区。
+const FUND_MIN_ANNUAL: f64 = 0.0;
+const FUND_MAX_ANNUAL: f64 = 30.0;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PaperPos {
@@ -49,6 +58,14 @@ async fn fetch_klines(http: &reqwest::Client, sym: &str, limit: u32) -> Option<V
     let url = format!("https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=1m&limit={}", sym, limit);
     let v: serde_json::Value = http.get(&url).send().await.ok()?.json().await.ok()?;
     v.as_array().cloned()
+}
+
+// 最近一期资金费率折算年化 (单期% × 3期/天 × 365)
+async fn fetch_funding_annual(http: &reqwest::Client, sym: &str) -> Option<f64> {
+    let url = format!("https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}", sym);
+    let v: serde_json::Value = http.get(&url).send().await.ok()?.json().await.ok()?;
+    let rate: f64 = v.get("lastFundingRate")?.as_str()?.parse().ok()?;
+    Some(rate * 100.0 * 3.0 * 365.0)
 }
 
 async fn load_stats(con: &mut redis::aio::MultiplexedConnection) -> PaperStats {
@@ -102,7 +119,7 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
                     format!("盈利因子 {:.2} 未达 1.3 门槛, 继续纸面", pf)
                 };
                 let _ = tg_tx.send(format!(
-                    "📝 <b>【纸面日报】</b> {}\n\n\
+                    "📝 <b>【纸面日报 v2: 加资金费率过滤】</b> {}\n\n\
                     状态: {} | 虚拟持仓: {} 个\n\
                     📒 账本: {} 笔 | 胜率 {:.0}% | 盈利因子 {:.2}\n\
                     累计净盈亏: <b>{:+.2}U</b> (虚拟)\n\n\
@@ -256,6 +273,12 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             let vsurge = vol5m / median;
 
             if ret60 >= RET60_MIN && ret15 >= RET15_MIN && ret5 >= RET5_MIN && vsurge >= VSURGE_MIN {
+                // v2 过滤: 价格结构达标后才查费率 (省 API 调用), 落在死区就放弃这个候选
+                let Some(fund_annual) = fetch_funding_annual(&http, &sym).await else { continue };
+                if fund_annual < FUND_MIN_ANNUAL || fund_annual > FUND_MAX_ANNUAL {
+                    info!("📝 [纸面] {} 价格结构达标但费率年化 {:+.1}% 不在 [{},{}] 区间, 放弃", sym, fund_annual, FUND_MIN_ANNUAL, FUND_MAX_ANNUAL);
+                    continue;
+                }
                 // 入场价用进行中那根 K 的最新价 (≈此刻市价单能成交的价), 不用已收盘的
                 // "过期价"——拉升行情里旧收盘价系统性偏低, 会虚增账本利润
                 let live_px = kf(&kl[kl.len() - 1], 4);
@@ -266,10 +289,10 @@ pub async fn run_paper_trader(redis_client: redis::Client, tg_tx: mpsc::Sender<S
                     let _: () = redis::cmd("SET").arg(format!("PAPER_POS_{}", sym)).arg(j).query_async(&mut con).await.unwrap_or(());
                 }
                 slots -= 1;
-                info!("📝 [纸面] {} 开仓 @ {} (1h {:+.1}% / 5m爆量 {:.1}x / 距高点 {:.1}%)", sym, entry_px, ret60, vsurge, dist);
+                info!("📝 [纸面] {} 开仓 @ {} (1h {:+.1}% / 5m爆量 {:.1}x / 距高点 {:.1}% / 费率年化 {:+.1}%)", sym, entry_px, ret60, vsurge, dist, fund_annual);
                 let _ = tg_tx.send(format!(
-                    "📝 <b>【纸面开仓】</b> {} (虚拟 {}U, 不是真单!)\n入场价: {:.6}\n信号: 1h {:+.1}% | 15m {:+.1}% | 爆量 {:.1}x | 距24h高点 {:.1}%\n出场规则: 高点回撤 {}% 自动了结",
-                    sym, NOTIONAL, entry_px, ret60, ret15, vsurge, dist, trail)).await;
+                    "📝 <b>【纸面开仓 v2】</b> {} (虚拟 {}U, 不是真单!)\n入场价: {:.6}\n信号: 1h {:+.1}% | 15m {:+.1}% | 爆量 {:.1}x | 距24h高点 {:.1}%\n资金费率年化: {:+.1}% (过滤区间 [{:.0}%,{:.0}%])\n出场规则: 高点回撤 {}% 自动了结",
+                    sym, NOTIONAL, entry_px, ret60, ret15, vsurge, dist, fund_annual, FUND_MIN_ANNUAL, FUND_MAX_ANNUAL, trail)).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
