@@ -8,6 +8,8 @@ mod portfolio;
 mod ml_engine;
 mod guardian;
 mod funding;
+mod grid_scanner;
+mod grid_paper;
 mod paper;
 
 use std::collections::HashMap;
@@ -657,6 +659,24 @@ async fn main() {
     let funding_tg = tg_tx.clone();
     tokio::spawn(async move {
         funding::run_funding_monitor(funding_redis, funding_tg).await;
+    });
+
+    // ==========================================
+    // MODULE: 网格候选扫描 (震荡型标的侦察, 不下单)
+    // ==========================================
+    let grid_redis = redis_client.clone();
+    let grid_tg = tg_tx.clone();
+    tokio::spawn(async move {
+        grid_scanner::run_grid_scanner(grid_redis, grid_tg).await;
+    });
+
+    // ==========================================
+    // MODULE: 网格纸面交易 (零实弹前向实测)
+    // ==========================================
+    let grid_paper_redis = redis_client.clone();
+    let grid_paper_tg = tg_tx.clone();
+    tokio::spawn(async move {
+        grid_paper::run_grid_paper(grid_paper_redis, grid_paper_tg).await;
     });
 
     info!("矩阵核心系统正在运行中 (Matrix Engine Core Running)... 按 Ctrl+C 终止");
