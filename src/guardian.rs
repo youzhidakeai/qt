@@ -19,6 +19,11 @@ use tracing::{info, error};
 
 use crate::execution::{BinanceExecutionClient, SymbolInfo};
 
+// 状态持久化到 Redis (GUARD_STATE_<sym>): own_stop_id/peak/trail_armed 若只存内存,
+// 引擎一重启就丢 —— 保镖会认不出交易所里自己挂的止损单, 按"用户手动单不碰"的
+// 规矩放着不管, 移动止盈棘轮从此失灵 (实盘已因此发生过: 激活消息发了,
+// 止损却一直钉在灾难线上, "保底出场价"成了空头支票)。
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct GuardState {
     // 我们自己挂的止损单 (用户手动挂的止损不归我们管，也绝不动它)
     own_stop_id: Option<u64>,
@@ -161,6 +166,7 @@ pub async fn run_guardian(
                 }
             }
             let _: () = redis::cmd("DEL").arg(&key).query_async(&mut con).await.unwrap_or(());
+            let _: () = redis::cmd("DEL").arg(format!("GUARD_STATE_{}", sym)).query_async(&mut con).await.unwrap_or(());
             states.remove(&sym);
         }
 
@@ -179,7 +185,17 @@ pub async fn run_guardian(
             let opened_at: u64 = redis::cmd("GET").arg(&opened_key).query_async::<Option<String>>(&mut con).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(now_ms);
             let held_min = now_ms.saturating_sub(opened_at) / 60_000;
 
-            let st = states.entry(sym.clone()).or_default();
+            // 状态恢复: 内存没有时先从 Redis 读 (引擎重启后接续之前的 peak/armed/归属记录)
+            if !states.contains_key(&sym) {
+                let restored: Option<GuardState> = redis::cmd("GET").arg(format!("GUARD_STATE_{}", sym))
+                    .query_async::<Option<String>>(&mut con).await.ok().flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok());
+                if restored.is_some() {
+                    info!("🛡 [{}] 已从 Redis 恢复保镖状态 (重启接续)", sym);
+                }
+                states.insert(sym.clone(), restored.unwrap_or_default());
+            }
+            let st = states.get_mut(&sym).unwrap();
             let is_long = amt > Decimal::ZERO;
 
             // ---------- 0. 移动止盈: 跟踪最优价, 浮盈过激活线后武装 ----------
@@ -245,6 +261,18 @@ pub async fn run_guardian(
                     match existing_stop {
                         Some(o) => {
                             let oid = o.get("algoId").and_then(|v| v.as_u64());
+                            // 孤儿收养: 若我们没有任何归属记录 (Redis 状态也丢了的极端情况),
+                            // 把在场的整仓止损单收养过来继续管理 —— 棘轮只朝有利方向搬, 不会搬坏。
+                            if st.own_stop_id.is_none() {
+                                if let (Some(id), Some(tp)) = (oid, o.get("triggerPrice").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok())) {
+                                    st.own_stop_id = Some(id);
+                                    st.stop_price = tp;
+                                    if st.entry_used <= Decimal::ZERO {
+                                        st.entry_used = entry;
+                                    }
+                                    info!("🛡 [{}] 收养在场止损单 #{} @ {} (归属记录恢复, 棘轮重新接管)", sym, id, tp.normalize());
+                                }
+                            }
                             let is_ours = st.own_stop_id.is_some() && st.own_stop_id == oid;
                             if is_ours {
                                 // 重挂条件: ① 移动止盈棘轮上移超 0.1% (只朝有利方向)
@@ -325,6 +353,11 @@ pub async fn run_guardian(
                         let _ = tg_tx.send(format!("❌ <b>【保镖告警】</b> {} 超时自动平仓失败: {}", sym, e)).await;
                     }
                 }
+            }
+
+            // ---------- 4. 状态持久化: 每轮落盘, 引擎重启后无缝接续 ----------
+            if let Ok(j) = serde_json::to_string(&*st) {
+                let _: () = redis::cmd("SET").arg(format!("GUARD_STATE_{}", sym)).arg(j).query_async(&mut con).await.unwrap_or(());
             }
         }
     }
