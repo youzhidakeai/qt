@@ -200,6 +200,15 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
 
         // ---------- 初始化: 摆格线 + 挂初始买单 ----------
         if need_init {
+            // 如果存在旧网格且标的不同，先清理旧网格遗留挂单
+            if let Some(old_g) = &state {
+                if old_g.symbol != symbol {
+                    info!("🔲 [网格实盘] 切换标的 {} -> {}, 清理旧挂单", old_g.symbol, symbol);
+                    cancel_all(&spot, old_g).await;
+                    // Note: 不做市价清仓，只撤销挂单，旧标的现货作为投资保留，或手动卖出
+                }
+            }
+            
             match init_grid(&spot, &symbol, budget).await {
                 Ok(g) => {
                     let _ = tg_tx.send(format!(
