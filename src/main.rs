@@ -10,6 +10,8 @@ mod guardian;
 mod funding;
 mod grid_scanner;
 mod grid_paper;
+mod grid_live;
+mod spot;
 mod paper;
 
 use std::collections::HashMap;
@@ -677,6 +679,16 @@ async fn main() {
     let grid_paper_tg = tg_tx.clone();
     tokio::spawn(async move {
         grid_paper::run_grid_paper(grid_paper_redis, grid_paper_tg).await;
+    });
+
+    // ==========================================
+    // MODULE: 网格实盘执行器 (默认关闭, /gridlive on 显式开启)
+    // ==========================================
+    let spot_client = std::sync::Arc::new(spot::SpotClient::from_env());
+    let grid_live_redis = redis_client.clone();
+    let grid_live_tg = tg_tx.clone();
+    tokio::spawn(async move {
+        grid_live::run_grid_live(spot_client, grid_live_redis, grid_live_tg).await;
     });
 
     info!("矩阵核心系统正在运行中 (Matrix Engine Core Running)... 按 Ctrl+C 终止");

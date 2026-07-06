@@ -87,6 +87,20 @@ if [ -d "research" ]; then
     fi
 fi
 
+# 3.6 部署网格实盘独立监听 (watchdog)
+if [ -f "scripts/grid_watchdog.sh" ]; then
+    echo "🐶 正在部署网格独立监听..."
+    sudo mkdir -p "$DEPLOY_DIR/scripts"
+    sudo cp scripts/grid_watchdog.sh "$DEPLOY_DIR/scripts/"
+    sudo chmod +x "$DEPLOY_DIR/scripts/grid_watchdog.sh"
+    sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DEPLOY_DIR/scripts"
+    if [ -f "matrix-quant-watchdog.service" ] && [ -f "matrix-quant-watchdog.timer" ]; then
+        sudo cp matrix-quant-watchdog.service matrix-quant-watchdog.timer "$SYSTEMD_DIR/"
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now matrix-quant-watchdog.timer
+    fi
+fi
+
 # 4. 部署 Systemd 服务文件
 if [ -f "$SERVICE_NAME" ]; then
     echo "📝 发现服务配置文件 $SERVICE_NAME, 正在注册到 Systemd..."

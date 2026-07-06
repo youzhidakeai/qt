@@ -1,0 +1,7 @@
+[Unit]
+Description=Matrix Quant 网格实盘独立监听 (引擎卡死/挂单无人看管时报警)
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/opt/matrix-quant/scripts/grid_watchdog.sh

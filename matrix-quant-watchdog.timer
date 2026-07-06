@@ -1,0 +1,9 @@
+[Unit]
+Description=每 10 分钟运行一次网格实盘独立监听
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
