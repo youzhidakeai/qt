@@ -893,21 +893,30 @@ async fn answer(
             let reply = match parts.as_slice() {
                 [] | ["status"] => {
                     let enabled = get(&mut con, "GRID_LIVE_ENABLED", "0").await;
-                    let symbol = get(&mut con, "GRID_LIVE_SYMBOL", "(未设置)").await;
+                    let symbol = get(&mut con, "GRID_LIVE_SYMBOL", "AUTO").await;
                     let budget = get(&mut con, "GRID_LIVE_BUDGET", "50").await;
-                    let state_line = match get(&mut con, "GRID_LIVE_STATE", "").await.as_str() {
-                        "" => "  (无运行中的网格)".to_string(),
-                        s => match serde_json::from_str::<serde_json::Value>(s) {
-                            Ok(v) => format!(
-                                "  区间: {} ~ {}\n  已实现: {}U ({} 回合)",
-                                v["lines"][0], v["lines"].as_array().and_then(|a| a.last()).cloned().unwrap_or_default(),
-                                v["realized_total"], v["round_trips"]),
-                            Err(_) => "  (状态解析失败)".to_string(),
-                        },
-                    };
+                    let slots = get(&mut con, "GRID_LIVE_MAX_ACTIVE", "2").await;
+                    let keys: Vec<String> = redis::cmd("KEYS").arg("GRID_LIVE_STATE_*").query_async(&mut con).await.unwrap_or_default();
+                    let mut state_lines = String::new();
+                    for k in &keys {
+                        if let Ok(Some(s)) = redis::cmd("GET").arg(k).query_async::<Option<String>>(&mut con).await {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                                state_lines.push_str(&format!(
+                                    "  • {} | 区间 {} ~ {} | 已实现 {}U ({} 回合)\n",
+                                    v["symbol"].as_str().unwrap_or("?"),
+                                    v["lines"][0], v["lines"].as_array().and_then(|a| a.last()).cloned().unwrap_or_default(),
+                                    v["realized_total"], v["round_trips"]));
+                            }
+                        }
+                    }
+                    if state_lines.is_empty() {
+                        state_lines = "  (无运行中的网格)\n".to_string();
+                    }
                     format!(
-                        "🔲 <b>网格实盘执行器</b> (真钱模块)\n\n开关: {} | 标的: {} | 预算: {}U\n{}\n\n⚠️ 唯一会下真实现货订单的模块, 默认关闭。",
-                        if enabled == "1" { "🔴 运行中 (真实下单!)" } else { "⚪️ 关闭" }, symbol, budget, state_line)
+                        "🔲 <b>网格实盘执行器</b> (真钱模块)\n\n开关: {} | 模式: {} | 总预算: {}U | 并发槽位: {}\n<b>运行中的网格:</b>\n{}\n⚠️ 唯一会下真实现货订单的模块, 默认关闭。",
+                        if enabled == "1" { "🔴 运行中 (真实下单!)" } else { "⚪️ 关闭" },
+                        if symbol == "AUTO" || symbol.is_empty() { "全自动选币".to_string() } else { format!("手动指定 {}", symbol) },
+                        budget, slots, state_lines)
                 }
                 ["on"] => {
                     let _: () = redis::cmd("SET").arg("GRID_LIVE_SYMBOL").arg("AUTO").query_async(&mut con).await.unwrap_or(());
@@ -936,12 +945,21 @@ async fn answer(
                     match v.parse::<f64>() {
                         Ok(b) if (10.0..=100000.0).contains(&b) => {
                             let _: () = redis::cmd("SET").arg("GRID_LIVE_BUDGET").arg(v.to_string()).query_async(&mut con).await.unwrap_or(());
-                            format!("✅ 网格预算已设为 {}U (对运行中的网格不生效, 下次启动时使用)。", b)
+                            format!("✅ 网格总预算已设为 {}U (均分到各并发槽位; 对运行中的网格不生效, 新网格启动时使用)。", b)
                         }
                         _ => "❌ 无效预算, 范围 10 ~ 100000 U。".to_string(),
                     }
                 }
-                _ => "用法:\n/gridlive status - 查看状态\n/gridlive on - 全自动选币开启 (真钱!)\n/gridlive on SYMBOL - 手动指定币开启\n/gridlive off - 暂停 (撤单保留库存)\n/gridlive liquidate - 清算离场\n/gridlive budget 50 - 设预算".to_string(),
+                ["slots", v] => {
+                    match v.parse::<usize>() {
+                        Ok(n) if (1..=6).contains(&n) => {
+                            let _: () = redis::cmd("SET").arg("GRID_LIVE_MAX_ACTIVE").arg(v.to_string()).query_async(&mut con).await.unwrap_or(());
+                            format!("✅ 并发网格数已设为 {} (总预算均分; 注意: 槽位越多每格越小, 预算太小会因低于交易所最小名义启动失败)。", n)
+                        }
+                        _ => "❌ 无效槽位数, 范围 1 ~ 6。".to_string(),
+                    }
+                }
+                _ => "用法:\n/gridlive status - 查看状态\n/gridlive on - 全自动选币开启 (真钱!)\n/gridlive on SYMBOL - 手动指定币开启\n/gridlive off - 暂停 (撤单保留库存)\n/gridlive liquidate - 清算离场\n/gridlive budget 50 - 设总预算\n/gridlive slots 2 - 设并发网格数".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
