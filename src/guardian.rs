@@ -36,6 +36,9 @@ struct GuardState {
     trail_armed: bool,
     // 已播报过的最高 ROE 里程碑 (只升不降, 防止反复提醒同一档)
     last_milestone_roe: i32,
+    // 激活后首次真正搬动交易所止损单的确认是否已发 (SYN事故教训: 激活消息 ≠ 止损已搬)
+    #[serde(default)]
+    trail_confirm_sent: bool,
     last_hold_alert_min: u64,
     stop_error_notified: bool,
     auto_close_attempted: bool,
@@ -43,7 +46,7 @@ struct GuardState {
 
 impl Default for GuardState {
     fn default() -> Self {
-        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
+        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
     }
 }
 
@@ -224,7 +227,7 @@ pub async fn run_guardian(
                     let profit_roe = (profit_pct * lev).round_dp(1).normalize();
                     info!("🔒 [{}] 移动止盈已激活 (ROE {:+}%, {}x), 从最优价回撤币价 {:.2}% 落袋", sym, profit_roe, lev, trail_pct);
                     let _ = tg_tx.send(format!(
-                        "🔒 <b>【移动止盈已激活】</b> {}\n\n当前浮盈: ROE <b>{:+}%</b> (已过激活线 ROE {}%, 杠杆 {}x)\n从此上不封顶: 止损将跟随最高点上移, ROE 从峰值回吐 {}% 自动落袋\n当前保底出场价: <b>{}</b> (盈转亏已不可能)",
+                        "🔒 <b>【移动止盈已激活】</b> {}\n\n当前浮盈: ROE <b>{:+}%</b> (已过激活线 ROE {}%, 杠杆 {}x)\n从此上不封顶: 止损将跟随最高点上移, ROE 从峰值回吐 {}% 自动落袋\n目标保底出场价: <b>{}</b>\n⚠️ 以交易所实际挂单为准: 止损单实际搬到位后会另发【止损已实际上移】确认, 没收到确认前保底不生效",
                         sym, profit_roe, arm_roe, lev, trail_roe, floor_px.round_dp(6).normalize())).await;
                 }
             }
@@ -258,6 +261,7 @@ pub async fn run_guardian(
                     let desired_px = align_to_tick(raw_desired, tick, is_long);
 
                     let mut place_new = false;
+                    let mut replace_old: Option<u64> = None;
                     match existing_stop {
                         Some(o) => {
                             let oid = o.get("algoId").and_then(|v| v.as_u64());
@@ -285,12 +289,10 @@ pub async fn run_guardian(
                                 let drifted = !st.trail_armed && st.entry_used > Decimal::ZERO
                                     && ((entry - st.entry_used).abs() / entry) > dec!(0.005);
                                 if improved || drifted {
-                                    if let Some(oid) = oid {
-                                        if exec.cancel_algo_order(oid).await.is_ok() {
-                                            st.own_stop_id = None;
-                                            place_new = true;
-                                        }
-                                    }
+                                    // 先挂新单、成功后再撤旧单 —— 撤单在前的顺序在"撤成功+挂失败"
+                                    // 时会留下无保护窗口 (仓位裸奔), 顺序在此不可反转
+                                    replace_old = oid;
+                                    place_new = true;
                                 }
                             }
                         }
@@ -303,14 +305,27 @@ pub async fn run_guardian(
                         let stop_str = stop_px.normalize().to_string();
                         match exec.place_stop_market_close(&sym, side, &stop_str).await {
                             Ok(oid) => {
+                                // 新单已就位, 现在才撤旧单 (撤失败无害: 更远的旧单触发时仓位已平, 空转)
+                                if let Some(old) = replace_old {
+                                    if let Err(e) = exec.cancel_algo_order(old).await {
+                                        info!("🛡 [{}] 旧止损单 #{} 撤销失败 (可能已触发/已撤): {}", sym, old, e);
+                                    }
+                                }
                                 st.own_stop_id = Some(oid);
                                 st.entry_used = entry;
                                 st.stop_price = stop_px;
                                 st.stop_error_notified = false;
                                 if st.trail_armed {
-                                    // 棘轮上移只写日志, 不刷 TG (拉升时可能每 10 秒动一次)
                                     let locked = (amt.abs() * (stop_px - entry) * if is_long { Decimal::ONE } else { dec!(-1) }).round_dp(2).normalize();
                                     info!("🔒 [{}] 止盈棘轮上移 @ {} (锁定盈亏 {:+}U)", sym, stop_str, locked);
+                                    // 激活后首次真正搬动交易所止损单 → 发一次实锤确认 (SYN事故教训:
+                                    // 激活消息只是意图, 这条才是交易所侧已兑现的证据); 后续上移只写日志防刷屏
+                                    if !st.trail_confirm_sent {
+                                        st.trail_confirm_sent = true;
+                                        let _ = tg_tx.send(format!(
+                                            "✅ <b>【止损已实际上移】</b> {}\n交易所挂单已确认: 触发价 <b>{}</b> (锁定盈亏 {:+}U)\n之后每次上移在服务器日志可查, 也可随时 /guard status 核对。",
+                                            sym, stop_str, locked)).await;
+                                    }
                                 } else {
                                     // 触发时的预计亏损 = 仓位数量 × |均价 - 止损价| (市价成交, 滑点另计)
                                     let est_loss = (amt.abs() * (entry - stop_px).abs()).round_dp(2).normalize();
@@ -319,10 +334,15 @@ pub async fn run_guardian(
                                 }
                             }
                             Err(e) => {
-                                error!("🛡 [{}] 挂硬止损失败: {}", sym, e);
-                                if !st.stop_error_notified {
-                                    st.stop_error_notified = true;
-                                    let _ = tg_tx.send(format!("⚠️ <b>【保镖告警】</b> {} 挂硬止损失败, 该仓位当前无保护!\n原因: {}", sym, e)).await;
+                                if replace_old.is_some() {
+                                    // 棘轮换单失败, 但旧止损单还在场, 仓位仍有保护 (下一轮重试)
+                                    error!("🛡 [{}] 棘轮换挂新止损失败 (旧单仍生效): {}", sym, e);
+                                } else {
+                                    error!("🛡 [{}] 挂硬止损失败: {}", sym, e);
+                                    if !st.stop_error_notified {
+                                        st.stop_error_notified = true;
+                                        let _ = tg_tx.send(format!("⚠️ <b>【保镖告警】</b> {} 挂硬止损失败, 该仓位当前无保护!\n原因: {}", sym, e)).await;
+                                    }
                                 }
                             }
                         }

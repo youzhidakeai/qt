@@ -52,6 +52,8 @@ enum Command {
     Guard(String),
     #[command(description = "纸面交易引擎 (零实弹)。用法: /paper status | on | off | trail &lt;百分比&gt; | reset")]
     Paper(String),
+    #[command(description = "现货网格实盘 (真钱!)。用法: /gridlive status | on &lt;SYMBOL&gt; | off | liquidate | budget &lt;U&gt;")]
+    GridLive(String),
 }
 
 pub async fn run_telegram_bot(
@@ -765,7 +767,7 @@ async fn answer(
                             set(&mut con, "GUARD_TRAIL_ARM_ROE", arm.to_string()).await;
                             set(&mut con, "GUARD_TRAIL_ROE", pct.to_string()).await;
                             set(&mut con, "GUARD_TRAIL_ENABLED", "1".into()).await;
-                            format!("🔒 移动止盈已设为: ROE +{}% 激活, 峰值回吐 ROE {}% 落袋 (按各仓位杠杆自动折算币价)。激活 &gt; 回吐保证激活后不会盈转亏。", a, p)
+                            format!("🔒 移动止盈已设为: ROE +{}% 激活, 峰值回吐 ROE {}% 落袋 (按各仓位杠杆自动折算币价)。收到【止损已实际上移】确认后, 该仓位最差保本出场。", a, p)
                         }
                         _ => "❌ 无效参数 (ROE 百分比)。要求: 激活 &gt; 回吐, 例: /guard trail 20 15".to_string(),
                     }
@@ -861,6 +863,85 @@ async fn answer(
                     "🧹 纸面账本与虚拟持仓已清零, 重新开始记录。".to_string()
                 }
                 _ => "用法:\n/paper status - 账本与持仓\n/paper on|off - 开关\n/paper trail 3 - 回撤线百分比\n/paper reset - 清零账本".to_string(),
+            };
+            bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
+        }
+        Command::GridLive(args) => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            let mut con = match redis::Client::open(redis_url).ok() {
+                Some(c) => match c.get_multiplexed_async_connection().await {
+                    Ok(con) => con,
+                    Err(e) => {
+                        bot.send_message(msg.chat.id, format!("❌ Redis 连接失败: {}", e)).await?;
+                        return Ok(());
+                    }
+                },
+                None => {
+                    bot.send_message(msg.chat.id, "❌ Redis 配置无效").await?;
+                    return Ok(());
+                }
+            };
+            let get = |con: &mut redis::aio::MultiplexedConnection, key: &str, def: &str| {
+                let mut con = con.clone();
+                let key = key.to_string();
+                let def = def.to_string();
+                async move {
+                    redis::cmd("GET").arg(&key).query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or(def)
+                }
+            };
+            let reply = match parts.as_slice() {
+                [] | ["status"] => {
+                    let enabled = get(&mut con, "GRID_LIVE_ENABLED", "0").await;
+                    let symbol = get(&mut con, "GRID_LIVE_SYMBOL", "(未设置)").await;
+                    let budget = get(&mut con, "GRID_LIVE_BUDGET", "50").await;
+                    let state_line = match get(&mut con, "GRID_LIVE_STATE", "").await.as_str() {
+                        "" => "  (无运行中的网格)".to_string(),
+                        s => match serde_json::from_str::<serde_json::Value>(s) {
+                            Ok(v) => format!(
+                                "  区间: {} ~ {}\n  已实现: {}U ({} 回合)",
+                                v["lines"][0], v["lines"].as_array().and_then(|a| a.last()).cloned().unwrap_or_default(),
+                                v["realized_total"], v["round_trips"]),
+                            Err(_) => "  (状态解析失败)".to_string(),
+                        },
+                    };
+                    format!(
+                        "🔲 <b>网格实盘执行器</b> (真钱模块)\n\n开关: {} | 标的: {} | 预算: {}U\n{}\n\n⚠️ 唯一会下真实现货订单的模块, 默认关闭。",
+                        if enabled == "1" { "🔴 运行中 (真实下单!)" } else { "⚪️ 关闭" }, symbol, budget, state_line)
+                }
+                ["on"] => {
+                    let _: () = redis::cmd("SET").arg("GRID_LIVE_SYMBOL").arg("AUTO").query_async(&mut con).await.unwrap_or(());
+                    let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("1").query_async(&mut con).await.unwrap_or(());
+                    "🔴 网格实盘已开启: <b>全自动模式</b> (真实下单!)\n执行器将在 20 秒内从候选榜首自动选币摆盘; 网格失效自动冷却换下一个; 总亏损触及预算 20% 自动熔断停机。\n注意: 现货和合约钱包是分开的, 预算需在现货钱包内。".to_string()
+                }
+                ["on", sym] => {
+                    let sym = sym.to_uppercase();
+                    if !sym.ends_with("USDT") {
+                        "❌ 只支持 USDT 交易对, 例: /gridlive on ACTUSDT (或 /gridlive on 进入全自动选币)".to_string()
+                    } else {
+                        let _: () = redis::cmd("SET").arg("GRID_LIVE_SYMBOL").arg(&sym).query_async(&mut con).await.unwrap_or(());
+                        let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("1").query_async(&mut con).await.unwrap_or(());
+                        format!("🔴 网格实盘已开启: {} (手动指定, 真实下单!)\n执行器将在 20 秒内初始化: 校验现货余额/交易规则后摆盘。\n注意: 现货和合约钱包是分开的, 预算需在现货钱包内。", sym)
+                    }
+                }
+                ["off"] => {
+                    let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("0").query_async(&mut con).await.unwrap_or(());
+                    "⏸ 网格实盘暂停指令已发出: 执行器将在 20 秒内撤销全部挂单 (已买入的库存保留)。".to_string()
+                }
+                ["liquidate"] => {
+                    let _: () = redis::cmd("SET").arg("GRID_LIVE_LIQUIDATE").arg("1").query_async(&mut con).await.unwrap_or(());
+                    "🧹 清算指令已发出: 执行器将在 20 秒内撤单+市价卖出全部库存+停机。".to_string()
+                }
+                ["budget", v] => {
+                    match v.parse::<f64>() {
+                        Ok(b) if (10.0..=100000.0).contains(&b) => {
+                            let _: () = redis::cmd("SET").arg("GRID_LIVE_BUDGET").arg(v.to_string()).query_async(&mut con).await.unwrap_or(());
+                            format!("✅ 网格预算已设为 {}U (对运行中的网格不生效, 下次启动时使用)。", b)
+                        }
+                        _ => "❌ 无效预算, 范围 10 ~ 100000 U。".to_string(),
+                    }
+                }
+                _ => "用法:\n/gridlive status - 查看状态\n/gridlive on - 全自动选币开启 (真钱!)\n/gridlive on SYMBOL - 手动指定币开启\n/gridlive off - 暂停 (撤单保留库存)\n/gridlive liquidate - 清算离场\n/gridlive budget 50 - 设预算".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
