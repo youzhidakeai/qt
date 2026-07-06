@@ -3,13 +3,14 @@
 // ⚠️ 唯一会用真钱下现货单的模块。默认关闭 (GRID_LIVE_ENABLED=0), 部署后
 // 必须用 Telegram /gridlive on 显式开启才会动一分钱。
 //
-// 并发模型: 同时运行最多 GRID_LIVE_MAX_ACTIVE 个网格 (默认 2), 总预算
-// GRID_LIVE_BUDGET 均分到每个槽位; 每个网格的格线数按"每格名义 ≥ 交易所
-// 最小限制"动态推导 (预算越小格越少, 2~8 条之间)。
+// 并发模型: 同时运行最多 GRID_LIVE_MAX_ACTIVE 个网格 (默认 2)。
+// GRID_LIVE_BUDGET 是**每个网格**的预算 (默认 50U), 开新网格前检查现货 USDT
+// 可用余额是否够一份预算, 不够就不开 (用户要开更多网格时自行充值)。
+// 每个网格的格线数按"每格名义 ≥ 交易所最小限制"动态推导 (2~8 条)。
 // 自动模式 (GRID_LIVE_SYMBOL=AUTO): 空槽位从候选榜单自动补币, 网格越界
 // 失效后该币冷却 6 小时换下一个。手动模式: 只跑指定的那一个币。
 //
-// 盈利监听: 所有网格合计总盈亏(已实现+库存浮动) 亏到总预算 20% → 全部清算
+// 盈利监听: 所有网格合计总盈亏(已实现+库存浮动) 亏到 (每格预算×网格数) 的 20% → 全部清算
 // +彻底停机 (模型级失败要人工复盘, 不自动换币继续流血)。
 // 每小时聚合报告; 独立 shell watchdog 盯引擎本身的死活 (scripts/grid_watchdog.sh)。
 // ==========================================
@@ -195,7 +196,7 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
         let cfg_symbol = read_flag(&mut con, "GRID_LIVE_SYMBOL", "AUTO").await;
         let is_auto = cfg_symbol.is_empty() || cfg_symbol == "AUTO";
         let slots = if is_auto { max_active } else { 1 };
-        let per_budget = budget / slots as f64;
+        let per_budget = budget; // 预算是"每个网格"的, 不做均分; 钱不够就少开网格
 
         // 手动模式: 清理与指定标的不符的旧网格挂单 (库存保留, 不强卖)
         if !is_auto {
@@ -211,6 +212,16 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
         }
 
         while grids.len() < slots {
+            // 开新网格前先看现货 USDT 可用余额够不够一份预算 —— 不够就不开,
+            // 千万不能拿"余额不足"当币的问题去冷却候选 (会把整个榜单误伤一遍)
+            match spot.free_balance("USDT").await {
+                Ok(free) if free >= per_budget => {}
+                Ok(free) => {
+                    info!("🔲 [网格实盘] USDT 可用余额 {:.2} 不足一份网格预算 {:.0}, 暂不开新网格", free, per_budget);
+                    break;
+                }
+                Err(_) => break,
+            }
             let pick = if is_auto {
                 let Some(cand_json) = redis::cmd("GET").arg("GRID_CANDIDATES").query_async::<Option<String>>(&mut con).await.ok().flatten() else { break };
                 let Ok(cands) = serde_json::from_str::<Vec<String>>(&cand_json) else { break };
@@ -237,7 +248,7 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
             match init_grid(&spot, &pick, per_budget).await {
                 Ok(g) => {
                     let _ = tg_tx.send(format!(
-                        "🔲 <b>【网格实盘启动】</b> {} (真实订单!)\n槽位预算: {:.0}U | 每格: {:.2}U | 买入线: {} 条\n区间: {:.6} ~ {:.6}\n并发: {}/{} | 失效线: 越界再 {}%",
+                        "🔲 <b>【网格实盘启动】</b> {} (真实订单!)\n该网格预算: {:.0}U | 每格: {:.2}U | 买入线: {} 条\n区间: {:.6} ~ {:.6}\n并发: {}/{} | 失效线: 越界再 {}%",
                         g.symbol, per_budget, g.per_grid_quote, g.n_buy_lines(),
                         g.lines[0], g.lines.last().unwrap(), grids.len() + 1, slots, BUST_MARGIN_PCT)).await;
                     save_grid(&mut con, &g).await;
@@ -302,8 +313,9 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
             survivors.push(g.symbol.clone());
         }
 
-        // ---------- 盈利监听熔断: 全部网格合计 ----------
-        let loss_limit = -budget * MAX_LOSS_PCT_OF_BUDGET / 100.0;
+        // ---------- 盈利监听熔断: 全部网格合计, 上限随在跑网格数量伸缩 ----------
+        let deployed = budget * survivors.len().max(1) as f64;
+        let loss_limit = -deployed * MAX_LOSS_PCT_OF_BUDGET / 100.0;
         if !survivors.is_empty() && agg_pnl <= loss_limit {
             for g in grids.iter().filter(|g| survivors.contains(&g.symbol)) {
                 cancel_all(&spot, g).await;
@@ -312,7 +324,7 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
             }
             let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("0").query_async(&mut con).await.unwrap_or(());
             let _ = tg_tx.send(format!(
-                "🛑 <b>【网格盈利监听熔断】</b>\n全部网格合计总盈亏 {:+.2}U 触及亏损上限 {:.0}U (总预算的 {}%)\n已清算全部挂单与库存, <b>执行器彻底停机</b>。\n模型判定为不盈利——需要人工复盘后再决定是否重启。",
+                "🛑 <b>【网格盈利监听熔断】</b>\n全部网格合计总盈亏 {:+.2}U 触及亏损上限 {:.0}U (在场资金的 {}%)\n已清算全部挂单与库存, <b>执行器彻底停机</b>。\n模型判定为不盈利——需要人工复盘后再决定是否重启。",
                 agg_pnl, loss_limit, MAX_LOSS_PCT_OF_BUDGET)).await;
             continue;
         }
@@ -324,10 +336,10 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
         if reported != hour_bucket && !survivors.is_empty() {
             let _: () = redis::cmd("SET").arg("GRID_LIVE_LAST_REPORT_HOUR").arg(&hour_bucket).query_async(&mut con).await.unwrap_or(());
             let _ = tg_tx.send(format!(
-                "🔲 <b>【网格实盘小时报】</b> {}:00\n\n运行中: {} 个网格 ({})\n已实现: <b>{:+.2}U</b> ({} 回合) | 库存: 成本 {:.2}U → 现值 {:.2}U ({:+.2}U)\n总盈亏: <b>{:+.2}U</b> / 总预算 {:.0}U | 熔断线: {:.0}U",
+                "🔲 <b>【网格实盘小时报】</b> {}:00\n\n运行中: {} 个网格 ({})\n已实现: <b>{:+.2}U</b> ({} 回合) | 库存: 成本 {:.2}U → 现值 {:.2}U ({:+.2}U)\n总盈亏: <b>{:+.2}U</b> / 在场资金 {:.0}U | 熔断线: {:.0}U",
                 now.hour(), survivors.len(), survivors.join(", "),
                 agg_realized, agg_trips, agg_inv_cost, agg_inv_val, agg_inv_val - agg_inv_cost,
-                agg_pnl, budget, loss_limit)).await;
+                agg_pnl, deployed, loss_limit)).await;
         }
     }
 }

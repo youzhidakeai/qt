@@ -52,7 +52,7 @@ enum Command {
     Guard(String),
     #[command(description = "纸面交易引擎 (零实弹)。用法: /paper status | on | off | trail &lt;百分比&gt; | reset")]
     Paper(String),
-    #[command(description = "现货网格实盘 (真钱!)。用法: /gridlive status | on &lt;SYMBOL&gt; | off | liquidate | budget &lt;U&gt;")]
+    #[command(description = "现货网格实盘 (真钱!)。用法: /gridlive status | on [SYMBOL] | off | liquidate | budget &lt;U/网格&gt; | slots &lt;并发数&gt;")]
     GridLive(String),
 }
 
@@ -913,7 +913,7 @@ async fn answer(
                         state_lines = "  (无运行中的网格)\n".to_string();
                     }
                     format!(
-                        "🔲 <b>网格实盘执行器</b> (真钱模块)\n\n开关: {} | 模式: {} | 总预算: {}U | 并发槽位: {}\n<b>运行中的网格:</b>\n{}\n⚠️ 唯一会下真实现货订单的模块, 默认关闭。",
+                        "🔲 <b>网格实盘执行器</b> (真钱模块)\n\n开关: {} | 模式: {} | 预算: {}U/网格 | 并发上限: {}\n<b>运行中的网格:</b>\n{}\n⚠️ 唯一会下真实现货订单的模块, 默认关闭。",
                         if enabled == "1" { "🔴 运行中 (真实下单!)" } else { "⚪️ 关闭" },
                         if symbol == "AUTO" || symbol.is_empty() { "全自动选币".to_string() } else { format!("手动指定 {}", symbol) },
                         budget, slots, state_lines)
@@ -945,7 +945,7 @@ async fn answer(
                     match v.parse::<f64>() {
                         Ok(b) if (10.0..=100000.0).contains(&b) => {
                             let _: () = redis::cmd("SET").arg("GRID_LIVE_BUDGET").arg(v.to_string()).query_async(&mut con).await.unwrap_or(());
-                            format!("✅ 网格总预算已设为 {}U (均分到各并发槽位; 对运行中的网格不生效, 新网格启动时使用)。", b)
+                            format!("✅ 每个网格的预算已设为 {}U (对运行中的网格不生效, 新网格启动时使用; 开 N 个网格需要现货钱包里有 N 份预算)。", b)
                         }
                         _ => "❌ 无效预算, 范围 10 ~ 100000 U。".to_string(),
                     }
@@ -954,12 +954,12 @@ async fn answer(
                     match v.parse::<usize>() {
                         Ok(n) if (1..=6).contains(&n) => {
                             let _: () = redis::cmd("SET").arg("GRID_LIVE_MAX_ACTIVE").arg(v.to_string()).query_async(&mut con).await.unwrap_or(());
-                            format!("✅ 并发网格数已设为 {} (总预算均分; 注意: 槽位越多每格越小, 预算太小会因低于交易所最小名义启动失败)。", n)
+                            format!("✅ 并发网格数上限已设为 {} (每个网格独立占用一份预算, 现货 USDT 余额不够一份预算时不会开新网格)。", n)
                         }
                         _ => "❌ 无效槽位数, 范围 1 ~ 6。".to_string(),
                     }
                 }
-                _ => "用法:\n/gridlive status - 查看状态\n/gridlive on - 全自动选币开启 (真钱!)\n/gridlive on SYMBOL - 手动指定币开启\n/gridlive off - 暂停 (撤单保留库存)\n/gridlive liquidate - 清算离场\n/gridlive budget 50 - 设总预算\n/gridlive slots 2 - 设并发网格数".to_string(),
+                _ => "用法:\n/gridlive status - 查看状态\n/gridlive on - 全自动选币开启 (真钱!)\n/gridlive on SYMBOL - 手动指定币开启\n/gridlive off - 暂停 (撤单保留库存)\n/gridlive liquidate - 清算离场\n/gridlive budget 50 - 设每网格预算\n/gridlive slots 2 - 设并发上限".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
