@@ -400,7 +400,16 @@ async fn init_grid(spot: &SpotClient, symbol: &str, budget: f64) -> Result<LiveG
         let qty = g.per_grid_quote / g.lines[i];
         match spot.place_limit(symbol, "BUY", qty, g.lines[i], &rules).await {
             Ok(oid) => g.line_states[i] = Some(LineState::WaitBuy { order_id: oid }),
-            Err(e) => error!("🔲 [网格实盘] 初始第{}格买单失败: {} (巡逻时补挂)", i, e),
+            Err(e) => {
+                error!("🔲 [网格实盘] 初始第{}格买单失败: {} (巡逻时补挂)", i, e);
+                // Rollback successfully placed orders
+                for ls in &g.line_states {
+                    if let Some(LineState::WaitBuy { order_id }) = ls {
+                        let _ = spot.cancel_order(symbol, *order_id).await;
+                    }
+                }
+                return Err(format!("第{}格挂单被币安拒绝: {}。已撤销部分成功的挂单。", i+1, e));
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
