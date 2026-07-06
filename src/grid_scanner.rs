@@ -31,7 +31,7 @@ struct GridCandidate {
 }
 
 async fn fetch_hourly_closes(http: &reqwest::Client, sym: &str) -> Option<Vec<f64>> {
-    let url = format!("https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=1h&limit={}", sym, LOOKBACK_HOURS);
+    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1h&limit={}", sym, LOOKBACK_HOURS);
     let v: serde_json::Value = http.get(&url).send().await.ok()?.json().await.ok()?;
     let arr = v.as_array()?;
     // 丢弃进行中的最后一根 (与 paper.rs/funding.rs 同口径)
@@ -77,7 +77,7 @@ pub async fn run_grid_scanner(redis_client: redis::Client, tg_tx: mpsc::Sender<S
         };
 
         // ---------- 扫描 ----------
-        if let Ok(resp) = http.get("https://fapi.binance.com/fapi/v1/ticker/24hr").send().await {
+        if let Ok(resp) = http.get("https://api.binance.com/api/v3/ticker/24hr").send().await {
             if let Ok(tickers) = resp.json::<serde_json::Value>().await {
                 if let Some(arr) = tickers.as_array() {
                     // 先用一次性拉回的 24hr 数据做流动性预筛, 避免对冷门币也去查K线
@@ -119,27 +119,25 @@ pub async fn run_grid_scanner(redis_client: redis::Client, tg_tx: mpsc::Sender<S
             }
         }
 
-        // ---------- 每日报告 (20点后第一次扫描, Redis去重防重启重发) ----------
+        // ---------- 每小时报告 (扫描本身就是整点一轮, 扫完即报; 按小时去重防重启重发) ----------
         let now = time::OffsetDateTime::now_utc().to_offset(report_offset);
-        if now.hour() >= 20 {
-            let day = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
-            let reported = redis::cmd("GET").arg("GRID_LAST_REPORT_DAY").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_default();
-            if reported != day {
-                let _: () = redis::cmd("SET").arg("GRID_LAST_REPORT_DAY").arg(&day).query_async(&mut con).await.unwrap_or(());
-                let mut lines = String::new();
-                if latest.is_empty() {
-                    lines.push_str("  (本轮未筛出合格候选, 市场普遍趋势较强)\n");
-                } else {
-                    for c in latest.iter().take(MAX_REPORT) {
-                        lines.push_str(&format!(
-                            "  • {} | 效率比 {:.3} | 7日净涨跌 {:+.1}% | 日均波动路程 {:.0}% | 24h量 {:.0}百万U\n",
-                            c.sym, c.er, c.ret_pct, c.daily_move_pct, c.vol24h_m));
-                    }
+        let hour_bucket = format!("{:04}-{:02}-{:02}-{:02}", now.year(), now.month() as u8, now.day(), now.hour());
+        let reported = redis::cmd("GET").arg("GRID_LAST_REPORT_HOUR").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_default();
+        if reported != hour_bucket {
+            let _: () = redis::cmd("SET").arg("GRID_LAST_REPORT_HOUR").arg(&hour_bucket).query_async(&mut con).await.unwrap_or(());
+            let mut lines = String::new();
+            if latest.is_empty() {
+                lines.push_str("  (本轮未筛出合格候选, 市场普遍趋势较强)\n");
+            } else {
+                for c in latest.iter().take(MAX_REPORT) {
+                    lines.push_str(&format!(
+                        "  • {} | 效率比 {:.3} | 7日净涨跌 {:+.1}% | 日均波动路程 {:.0}% | 24h量 {:.0}百万U\n",
+                        c.sym, c.er, c.ret_pct, c.daily_move_pct, c.vol24h_m));
                 }
-                let _ = tg_tx.send(format!(
-                    "🔲 <b>【网格候选日报】</b> {}\n(纯侦察, 不下单; 现货网格建议标的——效率比低+净涨跌小+波动够+流动性够)\n\n{}\n💡 网格只吃震荡: 效率比越低越像来回抖动, 净涨跌控制在 ±{}% 以内避免沿趋势套牢/踏空。单边趋势币不要开网格。",
-                    day, lines, NET_RET_MAX_PCT)).await;
             }
+            let _ = tg_tx.send(format!(
+                "🔲 <b>【网格候选小时报】</b> {}:00\n(纯侦察, 不下单; 现货网格建议标的——效率比低+净涨跌小+波动够+流动性够)\n\n{}\n💡 网格只吃震荡: 效率比越低越像来回抖动, 净涨跌控制在 ±{}% 以内避免沿趋势套牢/踏空。单边趋势币不要开网格。",
+                now.hour(), lines, NET_RET_MAX_PCT)).await;
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(SCAN_SECS)).await;

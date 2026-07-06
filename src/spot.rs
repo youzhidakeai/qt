@@ -71,7 +71,10 @@ impl SpotClient {
         let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base_url, symbol);
         let v: serde_json::Value = self.client.get(&url).send().await.map_err(|e| e.to_string())?
             .json().await.map_err(|e| e.to_string())?;
-        let filters = v["symbols"][0]["filters"].as_array().ok_or("无 filters 字段")?;
+        if v.get("code").and_then(|c| c.as_i64()) == Some(-1121) {
+            return Err(format!("该币种在币安现货市场不存在或已下架 ({})", symbol));
+        }
+        let filters = v["symbols"][0]["filters"].as_array().ok_or(format!("无 filters 字段: {}", v.to_string()))?;
         let mut rules = SpotSymbolRules { tick_size: 0.0, step_size: 0.0, min_notional: 5.0 };
         for f in filters {
             match f["filterType"].as_str().unwrap_or("") {

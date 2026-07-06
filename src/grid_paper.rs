@@ -47,7 +47,7 @@ fn kf(k: &serde_json::Value, i: usize) -> f64 {
 
 async fn fetch_klines_since(http: &reqwest::Client, sym: &str, since_ms: u64) -> Option<Vec<serde_json::Value>> {
     let url = format!(
-        "https://fapi.binance.com/fapi/v1/klines?symbol={}&interval=1m&startTime={}&limit=1000",
+        "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1000",
         sym, since_ms
     );
     let v: serde_json::Value = http.get(&url).send().await.ok()?.json().await.ok()?;
@@ -57,7 +57,7 @@ async fn fetch_klines_since(http: &reqwest::Client, sym: &str, since_ms: u64) ->
 }
 
 async fn fetch_last_price(http: &reqwest::Client, sym: &str) -> Option<f64> {
-    let url = format!("https://fapi.binance.com/fapi/v1/ticker/price?symbol={}", sym);
+    let url = format!("https://api.binance.com/api/v3/ticker/price?symbol={}", sym);
     let v: serde_json::Value = http.get(&url).send().await.ok()?.json().await.ok()?;
     v.get("price")?.as_str()?.parse().ok()
 }
@@ -215,19 +215,17 @@ pub async fn run_grid_paper(redis_client: redis::Client, tg_tx: mpsc::Sender<Str
                 sym, NOTIONAL_PER_GRID, N_GRIDS, start_px, pos.lines[0], pos.lines.last().unwrap(), BUST_MARGIN_PCT)).await;
         }
 
-        // ---------- 3. 每日战报 ----------
+        // ---------- 3. 每小时战报 (按小时去重, 巡逻本身是60秒一次, 不能扫完就报) ----------
         let now = time::OffsetDateTime::now_utc().to_offset(report_offset);
-        if now.hour() >= 20 {
-            let day = format!("{:04}-{:02}-{:02}", now.year(), now.month() as u8, now.day());
-            let reported = redis::cmd("GET").arg("GRID_PAPER_LAST_REPORT_DAY").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_default();
-            if reported != day {
-                let _: () = redis::cmd("SET").arg("GRID_PAPER_LAST_REPORT_DAY").arg(&day).query_async(&mut con).await.unwrap_or(());
-                let stats = load_stats(&mut con).await;
-                let pf = if stats.gross_loss > 0.0 { stats.gross_win / stats.gross_loss } else { 0.0 };
-                let _ = tg_tx.send(format!(
-                    "🔲 <b>【网格纸面日报】</b> {}\n\n运行中标的: {} 个 | 单笔成交: {} 次 | 失效清算: {} 次\n盈利因子: {:.2}\n累计净盈亏: <b>{:+.2}U</b> (虚拟)\n\n💡 验证的是筛选方法在未来是否持续有效, 不是历史回测。",
-                    day, active_syms.len(), stats.trades, stats.busts, pf, stats.total_net)).await;
-            }
+        let hour_bucket = format!("{:04}-{:02}-{:02}-{:02}", now.year(), now.month() as u8, now.day(), now.hour());
+        let reported = redis::cmd("GET").arg("GRID_PAPER_LAST_REPORT_HOUR").query_async::<Option<String>>(&mut con).await.ok().flatten().unwrap_or_default();
+        if reported != hour_bucket {
+            let _: () = redis::cmd("SET").arg("GRID_PAPER_LAST_REPORT_HOUR").arg(&hour_bucket).query_async(&mut con).await.unwrap_or(());
+            let stats = load_stats(&mut con).await;
+            let pf = if stats.gross_loss > 0.0 { stats.gross_win / stats.gross_loss } else { 0.0 };
+            let _ = tg_tx.send(format!(
+                "🔲 <b>【网格纸面小时报】</b> {}:00\n\n运行中标的: {} 个 | 单笔成交: {} 次 | 失效清算: {} 次\n盈利因子: {:.2}\n累计净盈亏: <b>{:+.2}U</b> (虚拟)\n\n💡 验证的是筛选方法在未来是否持续有效, 不是历史回测。",
+                now.hour(), active_syms.len(), stats.trades, stats.busts, pf, stats.total_net)).await;
         }
     }
 }
