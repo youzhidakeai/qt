@@ -192,24 +192,29 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
             continue;
         }
 
-        // ---------- 补齐槽位 ----------
-        let cfg_symbol = read_flag(&mut con, "GRID_LIVE_SYMBOL", "AUTO").await;
-        let is_auto = cfg_symbol.is_empty() || cfg_symbol == "AUTO";
-        let slots = if is_auto { max_active } else { 1 };
-        let per_budget = budget; // 预算是"每个网格"的, 不做均分; 钱不够就少开网格
-
-        // 手动模式: 清理与指定标的不符的旧网格挂单 (库存保留, 不强卖)
-        if !is_auto {
-            for g in grids.iter().filter(|g| g.symbol != cfg_symbol) {
-                info!("🔲 [网格实盘] 手动切换标的 -> {}, 清理 {} 的遗留挂单", cfg_symbol, g.symbol);
+        // ---------- 按币停止指令 (GRID_LIVE_STOP_<sym>): 撤单保留库存, 删除该网格 ----------
+        let mut stopped: Vec<String> = Vec::new();
+        for g in grids.iter() {
+            if read_flag(&mut con, &format!("GRID_LIVE_STOP_{}", g.symbol), "0").await == "1" {
                 cancel_all(&spot, g).await;
                 let _ = tg_tx.send(format!(
-                    "🔲 <b>【网格换标的】</b> {} 的挂单已撤销 (库存 {:.6} {} 保留, 需要清仓用 /gridlive liquidate 或手动卖出)",
+                    "🔲 <b>【网格已停止】</b> {} (按指令)\n挂单已撤销, 库存 {:.6} {} 保留 (清仓需手动卖出)。",
                     g.symbol, g.held_qty(), g.base_asset)).await;
                 delete_grid(&mut con, &g.symbol).await;
+                let _: () = redis::cmd("DEL").arg(format!("GRID_LIVE_STOP_{}", g.symbol)).query_async(&mut con).await.unwrap_or(());
+                stopped.push(g.symbol.clone());
             }
-            grids.retain(|g| g.symbol == cfg_symbol);
         }
+        grids.retain(|g| !stopped.contains(&g.symbol));
+
+        // ---------- 补齐槽位: 钉选的币优先, 剩余槽位由自动模式从候选榜补 ----------
+        // 钉选 (pin) 与自动选币共存: /gridlive on SYM 钉住某币, 不影响其他在跑的网格
+        let pins: Vec<String> = redis::cmd("GET").arg("GRID_LIVE_PINS").query_async::<Option<String>>(&mut con).await
+            .ok().flatten().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let auto_fill = read_flag(&mut con, "GRID_LIVE_AUTO", "1").await == "1";
+        let slots = max_active;
+        let per_budget = budget; // 预算是"每个网格"的, 不做均分; 钱不够就少开网格
+        let is_auto = auto_fill; // 失效清算后的行为: 自动补位开着就换下一个, 关着就只减不增
 
         while grids.len() < slots {
             // 开新网格前先看现货 USDT 可用余额够不够一份预算 —— 不够就不开,
@@ -222,26 +227,34 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
                 }
                 Err(_) => break,
             }
-            let pick = if is_auto {
-                let Some(cand_json) = redis::cmd("GET").arg("GRID_CANDIDATES").query_async::<Option<String>>(&mut con).await.ok().flatten() else { break };
-                let Ok(cands) = serde_json::from_str::<Vec<String>>(&cand_json) else { break };
-                let mut picked = String::new();
-                for s in cands {
-                    if grids.iter().any(|g| g.symbol == s) {
-                        continue;
-                    }
-                    let cooling: Option<String> = redis::cmd("GET").arg(format!("GRID_LIVE_COOLDOWN_{}", s)).query_async(&mut con).await.ok().flatten();
-                    if cooling.is_none() {
-                        picked = s;
-                        break;
+            // 先补钉选的币, 再由自动模式从候选榜补剩余槽位
+            let mut pick = String::new();
+            for p in &pins {
+                if grids.iter().any(|g| &g.symbol == p) {
+                    continue;
+                }
+                let cooling: Option<String> = redis::cmd("GET").arg(format!("GRID_LIVE_COOLDOWN_{}", p)).query_async(&mut con).await.ok().flatten();
+                if cooling.is_none() {
+                    pick = p.clone();
+                    break;
+                }
+            }
+            if pick.is_empty() && auto_fill {
+                if let Some(cand_json) = redis::cmd("GET").arg("GRID_CANDIDATES").query_async::<Option<String>>(&mut con).await.ok().flatten() {
+                    if let Ok(cands) = serde_json::from_str::<Vec<String>>(&cand_json) {
+                        for s in cands {
+                            if grids.iter().any(|g| g.symbol == s) {
+                                continue;
+                            }
+                            let cooling: Option<String> = redis::cmd("GET").arg(format!("GRID_LIVE_COOLDOWN_{}", s)).query_async(&mut con).await.ok().flatten();
+                            if cooling.is_none() {
+                                pick = s;
+                                break;
+                            }
+                        }
                     }
                 }
-                picked
-            } else if grids.is_empty() {
-                cfg_symbol.clone()
-            } else {
-                String::new()
-            };
+            }
             if pick.is_empty() {
                 break;
             }
@@ -256,15 +269,10 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
                 }
                 Err(e) => {
                     error!("🔲 [网格实盘] {} 初始化失败: {}", pick, e);
-                    if is_auto {
-                        // 自动模式: 该币冷却, 换下一个候选, 不停机
-                        let _: () = redis::cmd("SET").arg(format!("GRID_LIVE_COOLDOWN_{}", pick)).arg("1")
-                            .arg("EX").arg(AUTO_COOLDOWN_SECS).query_async(&mut con).await.unwrap_or(());
-                        let _ = tg_tx.send(format!("⚠️ <b>【网格启动失败, 已跳过】</b> {}\n{}\n(自动模式: 冷却后换下一个候选)", pick, e)).await;
-                    } else {
-                        let _ = tg_tx.send(format!("❌ <b>【网格实盘启动失败】</b> {}\n{}\n执行器已自动关闭, 修正后重新 /gridlive on", pick, e)).await;
-                        let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("0").query_async(&mut con).await.unwrap_or(());
-                    }
+                    // 冷却该币后继续 (钉选的币冷却结束会自动重试, 不需要人工干预)
+                    let _: () = redis::cmd("SET").arg(format!("GRID_LIVE_COOLDOWN_{}", pick)).arg("1")
+                        .arg("EX").arg(AUTO_COOLDOWN_SECS).query_async(&mut con).await.unwrap_or(());
+                    let _ = tg_tx.send(format!("⚠️ <b>【网格启动失败, 已冷却】</b> {}\n{}\n(冷却 6 小时后自动重试/换下一个)", pick, e)).await;
                     break;
                 }
             }
@@ -288,17 +296,13 @@ pub async fn run_grid_live(spot: Arc<SpotClient>, redis_client: redis::Client, t
                 cancel_all(&spot, g).await;
                 let quote = liquidate_inventory(&spot, g).await;
                 let dir = if px >= bust_high { "涨破区间上沿(踏空离场)" } else { "跌破区间下沿(止损清算)" };
-                let next = if is_auto { "该币冷却 6 小时, 自动换下一个候选。" } else { "手动模式: 执行器已停机。" };
+                let next = if is_auto { "该币冷却 6 小时, 自动换下一个候选。" } else { "该币冷却 6 小时 (自动补位已关, 不换新币)。" };
                 let _ = tg_tx.send(format!(
                     "🔲 <b>【网格实盘失效清算】</b> {}\n{} @ {:.6}\n库存市价卖出收回 {:.2}U | 该网格已实现: {:+.2}U ({} 回合)\n{}",
                     g.symbol, dir, px, quote, g.realized_total, g.round_trips, next)).await;
                 delete_grid(&mut con, &g.symbol).await;
-                if is_auto {
-                    let _: () = redis::cmd("SET").arg(format!("GRID_LIVE_COOLDOWN_{}", g.symbol)).arg("1")
-                        .arg("EX").arg(AUTO_COOLDOWN_SECS).query_async(&mut con).await.unwrap_or(());
-                } else {
-                    let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("0").query_async(&mut con).await.unwrap_or(());
-                }
+                let _: () = redis::cmd("SET").arg(format!("GRID_LIVE_COOLDOWN_{}", g.symbol)).arg("1")
+                    .arg("EX").arg(AUTO_COOLDOWN_SECS).query_async(&mut con).await.unwrap_or(());
                 continue; // 不进 survivors
             }
 

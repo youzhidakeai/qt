@@ -52,7 +52,7 @@ enum Command {
     Guard(String),
     #[command(description = "纸面交易引擎 (零实弹)。用法: /paper status | on | off | trail &lt;百分比&gt; | reset")]
     Paper(String),
-    #[command(description = "现货网格实盘 (真钱!)。用法: /gridlive status | on [SYMBOL] | off | liquidate | budget &lt;U/网格&gt; | slots &lt;并发数&gt;")]
+    #[command(description = "现货网格实盘 (真钱!)。用法: /gridlive status | on [SYMBOL钉选] | unpin SYM | stop SYM | auto on|off | off | liquidate | budget &lt;U/网格&gt; | slots &lt;并发数&gt;")]
     GridLive(String),
 }
 
@@ -893,7 +893,8 @@ async fn answer(
             let reply = match parts.as_slice() {
                 [] | ["status"] => {
                     let enabled = get(&mut con, "GRID_LIVE_ENABLED", "0").await;
-                    let symbol = get(&mut con, "GRID_LIVE_SYMBOL", "AUTO").await;
+                    let auto_fill = get(&mut con, "GRID_LIVE_AUTO", "1").await;
+                    let pins_raw = get(&mut con, "GRID_LIVE_PINS", "[]").await;
                     let budget = get(&mut con, "GRID_LIVE_BUDGET", "50").await;
                     let slots = get(&mut con, "GRID_LIVE_MAX_ACTIVE", "2").await;
                     let keys: Vec<String> = redis::cmd("KEYS").arg("GRID_LIVE_STATE_*").query_async(&mut con).await.unwrap_or_default();
@@ -913,25 +914,61 @@ async fn answer(
                         state_lines = "  (无运行中的网格)\n".to_string();
                     }
                     format!(
-                        "🔲 <b>网格实盘执行器</b> (真钱模块)\n\n开关: {} | 模式: {} | 预算: {}U/网格 | 并发上限: {}\n<b>运行中的网格:</b>\n{}\n⚠️ 唯一会下真实现货订单的模块, 默认关闭。",
+                        "🔲 <b>网格实盘执行器</b> (真钱模块)\n\n开关: {} | 自动补位: {} | 钉选: {} | 预算: {}U/网格 | 并发上限: {}\n<b>运行中的网格:</b>\n{}\n⚠️ 唯一会下真实现货订单的模块, 默认关闭。",
                         if enabled == "1" { "🔴 运行中 (真实下单!)" } else { "⚪️ 关闭" },
-                        if symbol == "AUTO" || symbol.is_empty() { "全自动选币".to_string() } else { format!("手动指定 {}", symbol) },
+                        if auto_fill == "1" { "✅" } else { "⛔️" },
+                        if pins_raw == "[]" { "(无)".to_string() } else { pins_raw.clone() },
                         budget, slots, state_lines)
                 }
                 ["on"] => {
-                    let _: () = redis::cmd("SET").arg("GRID_LIVE_SYMBOL").arg("AUTO").query_async(&mut con).await.unwrap_or(());
                     let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("1").query_async(&mut con).await.unwrap_or(());
-                    "🔴 网格实盘已开启: <b>全自动模式</b> (真实下单!)\n执行器将在 20 秒内从候选榜首自动选币摆盘; 网格失效自动冷却换下一个; 总亏损触及预算 20% 自动熔断停机。\n注意: 现货和合约钱包是分开的, 预算需在现货钱包内。".to_string()
+                    "🔴 网格实盘已开启 (真实下单!)\n钉选的币优先摆盘, 剩余槽位由自动选币补齐 (/gridlive auto off 可关自动补位)。\n每个网格占一份预算, 现货 USDT 余额不够时不开新网格。".to_string()
                 }
                 ["on", sym] => {
                     let sym = sym.to_uppercase();
                     if !sym.ends_with("USDT") {
-                        "❌ 只支持 USDT 交易对, 例: /gridlive on ACTUSDT (或 /gridlive on 进入全自动选币)".to_string()
+                        "❌ 只支持 USDT 交易对, 例: /gridlive on ACTUSDT".to_string()
                     } else {
-                        let _: () = redis::cmd("SET").arg("GRID_LIVE_SYMBOL").arg(&sym).query_async(&mut con).await.unwrap_or(());
+                        // 钉选: 加入 pin 列表, 与自动选的网格共存, 不影响已在跑的
+                        let mut pins: Vec<String> = redis::cmd("GET").arg("GRID_LIVE_PINS").query_async::<Option<String>>(&mut con).await
+                            .ok().flatten().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                        if !pins.contains(&sym) {
+                            pins.push(sym.clone());
+                        }
+                        if let Ok(j) = serde_json::to_string(&pins) {
+                            let _: () = redis::cmd("SET").arg("GRID_LIVE_PINS").arg(j).query_async(&mut con).await.unwrap_or(());
+                        }
                         let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("1").query_async(&mut con).await.unwrap_or(());
-                        format!("🔴 网格实盘已开启: {} (手动指定, 真实下单!)\n执行器将在 20 秒内初始化: 校验现货余额/交易规则后摆盘。\n注意: 现货和合约钱包是分开的, 预算需在现货钱包内。", sym)
+                        format!("📌 已钉选 {} (真实下单!) —— 与在跑的其他网格共存, 有空槽位且现货 USDT 够一份预算时优先为它摆盘。\n取消钉选: /gridlive unpin {} | 停掉该网格: /gridlive stop {}", sym, sym, sym)
                     }
+                }
+                ["unpin", sym] => {
+                    let sym = sym.to_uppercase();
+                    let mut pins: Vec<String> = redis::cmd("GET").arg("GRID_LIVE_PINS").query_async::<Option<String>>(&mut con).await
+                        .ok().flatten().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                    pins.retain(|p| p != &sym);
+                    if let Ok(j) = serde_json::to_string(&pins) {
+                        let _: () = redis::cmd("SET").arg("GRID_LIVE_PINS").arg(j).query_async(&mut con).await.unwrap_or(());
+                    }
+                    format!("✅ 已取消钉选 {} (在跑的网格不受影响, 跑到失效为止; 立即停掉用 /gridlive stop {})", sym, sym)
+                }
+                ["stop", sym] => {
+                    let sym = sym.to_uppercase();
+                    let _: () = redis::cmd("SET").arg(format!("GRID_LIVE_STOP_{}", sym)).arg("1").query_async(&mut con).await.unwrap_or(());
+                    // 同时取消钉选, 否则空槽位下一轮又会把它开回来
+                    let mut pins: Vec<String> = redis::cmd("GET").arg("GRID_LIVE_PINS").query_async::<Option<String>>(&mut con).await
+                        .ok().flatten().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                    pins.retain(|p| p != &sym);
+                    if let Ok(j) = serde_json::to_string(&pins) {
+                        let _: () = redis::cmd("SET").arg("GRID_LIVE_PINS").arg(j).query_async(&mut con).await.unwrap_or(());
+                    }
+                    format!("⏸ 停止指令已发出: {} 的网格将在 20 秒内撤单 (库存保留), 且已取消钉选。", sym)
+                }
+                ["auto", v] if *v == "on" || *v == "off" => {
+                    let on = *v == "on";
+                    let _: () = redis::cmd("SET").arg("GRID_LIVE_AUTO").arg(if on { "1" } else { "0" }).query_async(&mut con).await.unwrap_or(());
+                    if on { "✅ 自动补位已开: 空槽位从候选榜自动选币。".to_string() }
+                    else { "⏸ 自动补位已关: 只跑钉选的币, 网格失效后不换新币。".to_string() }
                 }
                 ["off"] => {
                     let _: () = redis::cmd("SET").arg("GRID_LIVE_ENABLED").arg("0").query_async(&mut con).await.unwrap_or(());
@@ -959,7 +996,7 @@ async fn answer(
                         _ => "❌ 无效槽位数, 范围 1 ~ 6。".to_string(),
                     }
                 }
-                _ => "用法:\n/gridlive status - 查看状态\n/gridlive on - 全自动选币开启 (真钱!)\n/gridlive on SYMBOL - 手动指定币开启\n/gridlive off - 暂停 (撤单保留库存)\n/gridlive liquidate - 清算离场\n/gridlive budget 50 - 设每网格预算\n/gridlive slots 2 - 设并发上限".to_string(),
+                _ => "用法:\n/gridlive status - 查看状态\n/gridlive on - 开启 (真钱! 自动选币补位)\n/gridlive on SYMBOL - 钉选某币 (与其他网格共存)\n/gridlive unpin SYMBOL - 取消钉选\n/gridlive stop SYMBOL - 停掉单个网格 (撤单保留库存)\n/gridlive auto on|off - 自动补位开关\n/gridlive off - 全部暂停\n/gridlive liquidate - 全部清算离场\n/gridlive budget 50 - 设每网格预算\n/gridlive slots 2 - 设并发上限".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
