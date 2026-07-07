@@ -42,6 +42,9 @@ struct GuardState {
     // 棘轮卡住检测: 已激活但交易所止损明显落后于应有位置的连续轮数
     #[serde(default)]
     ratchet_stuck_cycles: u32,
+    // 移动止盈主扳机是否已发出平仓单 (防止重复市价单)
+    #[serde(default)]
+    trail_exit_fired: bool,
     last_hold_alert_min: u64,
     stop_error_notified: bool,
     auto_close_attempted: bool,
@@ -49,7 +52,7 @@ struct GuardState {
 
 impl Default for GuardState {
     fn default() -> Self {
-        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, ratchet_stuck_cycles: 0, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
+        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, ratchet_stuck_cycles: 0, trail_exit_fired: false, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
     }
 }
 
@@ -232,6 +235,43 @@ pub async fn run_guardian(
                     let _ = tg_tx.send(format!(
                         "🔒 <b>【移动止盈已激活】</b> {}\n\n当前浮盈: ROE <b>{:+}%</b> (已过激活线 ROE {}%, 杠杆 {}x)\n从此上不封顶: 止损将跟随最高点上移, ROE 从峰值回吐 {}% 自动落袋\n目标保底出场价: <b>{}</b>\n⚠️ 以交易所实际挂单为准: 止损单实际搬到位后会另发【止损已实际上移】确认, 没收到确认前保底不生效",
                         sym, profit_roe, arm_roe, lev, trail_roe, floor_px.round_dp(6).normalize())).await;
+                }
+            }
+
+            // ---------- 0.5 移动止盈主扳机: 引擎侧直接市价平仓 ----------
+            // 自动卖出不再寄生于"交易所止损单有没有被搬到位"(棘轮三次事故的教训):
+            // 已激活 + 标记价跌破回吐线 → 保镖直接市价平仓落袋 (reduceOnly, 只减不开)。
+            // 交易所侧止损单降级为引擎宕机时的兜底, 搬单成败不再决定卖出与否。
+            if trail_on && st.trail_armed && !st.trail_exit_fired && mark > Decimal::ZERO && st.peak > Decimal::ZERO {
+                let floor = if is_long {
+                    st.peak * (Decimal::ONE - trail_pct / dec!(100))
+                } else {
+                    st.peak * (Decimal::ONE + trail_pct / dec!(100))
+                };
+                let crossed = if is_long { mark <= floor } else { mark >= floor };
+                if crossed {
+                    let side = if is_long { "SELL" } else { "BUY" };
+                    let qty_str = amt.abs().normalize().to_string();
+                    let peak_roe_now = if is_long { (st.peak - entry) / entry * dec!(100) * lev } else { (entry - st.peak) / entry * dec!(100) * lev };
+                    let mark_roe_now = if is_long { (mark - entry) / entry * dec!(100) * lev } else { (entry - mark) / entry * dec!(100) * lev };
+                    match exec.place_order(&sym, side, "MARKET", &qty_str, true).await {
+                        Ok(_) => {
+                            st.trail_exit_fired = true;
+                            info!("💰 [{}] 移动止盈触发, 引擎直接市价平仓 (峰值ROE {:+.1}% 回落至 {:+.1}%)", sym, peak_roe_now, mark_roe_now);
+                            let _ = tg_tx.send(format!(
+                                "💰 <b>【移动止盈触发, 已市价平仓】</b> {}\n峰值 ROE {:+.1}% → 回落至 {:+.1}%, 触及回吐线\n引擎已直接市价落袋 (不依赖止损单)。成交结果稍后以【仓位已了结】汇报。",
+                                sym, peak_roe_now, mark_roe_now)).await;
+                            // 平仓单已发出, 本轮不再对该仓位做其他动作
+                            if let Ok(j) = serde_json::to_string(&*st) {
+                                let _: () = redis::cmd("SET").arg(format!("GUARD_STATE_{}", sym)).arg(j).query_async(&mut con).await.unwrap_or(());
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("💰 [{}] 移动止盈市价平仓失败 (下一轮重试, 交易所止损单仍兜底): {}", sym, e);
+                            let _ = tg_tx.send(format!("⚠️ <b>【移动止盈平仓失败】</b> {} : {}\n下一轮(10秒)自动重试; 交易所侧止损单仍在兜底。", sym, e)).await;
+                        }
+                    }
                 }
             }
 
