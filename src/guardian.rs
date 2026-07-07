@@ -288,11 +288,18 @@ pub async fn run_guardian(
                             if is_ours {
                                 // 重挂条件: ① 移动止盈棘轮上移超 0.1% (只朝有利方向)
                                 //          ② 未激活时均价漂移超 0.5% (如加仓后)
-                                let improved = st.stop_price > Decimal::ZERO && if is_long {
-                                    desired_px > st.stop_price * dec!(1.001)
+                                // 比较基准必须用交易所实际触发价 —— 内部记录 (st.stop_price)
+                                // 可能与现实脱节, 用它做基准会让棘轮"以为不用动" (BLUR 二次卡住的根因),
+                                // 而告警用的是真实价, 于是出现"告警响了、棘轮不动"的分裂
+                                let baseline = existing_trigger.unwrap_or(st.stop_price);
+                                let improved = baseline > Decimal::ZERO && if is_long {
+                                    desired_px > baseline * dec!(1.001)
                                 } else {
-                                    desired_px < st.stop_price * dec!(0.999)
+                                    desired_px < baseline * dec!(0.999)
                                 };
+                                // 自愈: 卡住检测已计数 ≥2 轮时无条件强制换单一次, 不再信任任何判断
+                                let force_retry = st.ratchet_stuck_cycles >= 2 && st.trail_armed;
+                                let improved = improved || force_retry;
                                 let drifted = !st.trail_armed && st.entry_used > Decimal::ZERO
                                     && ((entry - st.entry_used).abs() / entry) > dec!(0.005);
                                 if improved || drifted {
