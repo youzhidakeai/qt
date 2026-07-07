@@ -39,6 +39,9 @@ struct GuardState {
     // 激活后首次真正搬动交易所止损单的确认是否已发 (SYN事故教训: 激活消息 ≠ 止损已搬)
     #[serde(default)]
     trail_confirm_sent: bool,
+    // 棘轮卡住检测: 已激活但交易所止损明显落后于应有位置的连续轮数
+    #[serde(default)]
+    ratchet_stuck_cycles: u32,
     last_hold_alert_min: u64,
     stop_error_notified: bool,
     auto_close_attempted: bool,
@@ -46,7 +49,7 @@ struct GuardState {
 
 impl Default for GuardState {
     fn default() -> Self {
-        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
+        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, ratchet_stuck_cycles: 0, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
     }
 }
 
@@ -262,19 +265,23 @@ pub async fn run_guardian(
 
                     let mut place_new = false;
                     let mut replace_old: Option<u64> = None;
+                    let mut existing_trigger: Option<Decimal> = None;
                     match existing_stop {
                         Some(o) => {
                             let oid = o.get("algoId").and_then(|v| v.as_u64());
-                            // 孤儿收养: 若我们没有任何归属记录 (Redis 状态也丢了的极端情况),
-                            // 把在场的整仓止损单收养过来继续管理 —— 棘轮只朝有利方向搬, 不会搬坏。
-                            if st.own_stop_id.is_none() {
-                                if let (Some(id), Some(tp)) = (oid, o.get("triggerPrice").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok())) {
+                            let tp_opt = o.get("triggerPrice").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str(s).ok());
+                            existing_trigger = tp_opt;
+                            // 归属校准: 交易所在场的整仓止损单一律以现场为准收养 —— 记录缺失
+                            // (重启丢状态) 或单号过期 (换单途中崩溃/外力动过单) 都会让旧逻辑
+                            // 认为"这单不是我的"而永久袖手旁观 (BLUR 事故: 激活了却永不搬单)。
+                            if let (Some(id), Some(tp)) = (oid, tp_opt) {
+                                if st.own_stop_id != Some(id) {
+                                    info!("🛡 [{}] 收养/校准在场止损单 #{} @ {} (原记录 {:?})", sym, id, tp.normalize(), st.own_stop_id);
                                     st.own_stop_id = Some(id);
                                     st.stop_price = tp;
                                     if st.entry_used <= Decimal::ZERO {
                                         st.entry_used = entry;
                                     }
-                                    info!("🛡 [{}] 收养在场止损单 #{} @ {} (归属记录恢复, 棘轮重新接管)", sym, id, tp.normalize());
                                 }
                             }
                             let is_ours = st.own_stop_id.is_some() && st.own_stop_id == oid;
@@ -299,6 +306,7 @@ pub async fn run_guardian(
                         None => place_new = true,
                     }
 
+                    let mut moved_ok = false;
                     if place_new {
                         let side = if is_long { "SELL" } else { "BUY" };
                         let stop_px = desired_px;
@@ -315,6 +323,7 @@ pub async fn run_guardian(
                                 st.entry_used = entry;
                                 st.stop_price = stop_px;
                                 st.stop_error_notified = false;
+                                moved_ok = true;
                                 if st.trail_armed {
                                     let locked = (amt.abs() * (stop_px - entry) * if is_long { Decimal::ONE } else { dec!(-1) }).round_dp(2).normalize();
                                     info!("🔒 [{}] 止盈棘轮上移 @ {} (锁定盈亏 {:+}U)", sym, stop_str, locked);
@@ -346,6 +355,30 @@ pub async fn run_guardian(
                                 }
                             }
                         }
+                    }
+
+                    // ---------- 棘轮卡住检测 (BLUR 事故教训: 卡死必须出声, 不许沉默) ----------
+                    // 已激活但交易所在场止损明显落后于应有位置且本轮没有成功搬单 → 连续 3 轮报警
+                    if trail_on && st.trail_armed && !moved_ok {
+                        let lagging = existing_trigger.map(|tp| if is_long {
+                            desired_px > tp * dec!(1.005)
+                        } else {
+                            desired_px < tp * dec!(0.995)
+                        }).unwrap_or(false);
+                        if lagging {
+                            st.ratchet_stuck_cycles += 1;
+                            if st.ratchet_stuck_cycles == 3 || st.ratchet_stuck_cycles % 90 == 0 {
+                                let tp = existing_trigger.unwrap_or_default();
+                                error!("🛡 [{}] 棘轮疑似卡住: 交易所止损 {} 落后于应有 {} 已 {} 轮", sym, tp.normalize(), desired_px.normalize(), st.ratchet_stuck_cycles);
+                                let _ = tg_tx.send(format!(
+                                    "🚨 <b>【棘轮卡住告警】</b> {}\n移动止盈已激活, 但交易所止损单 ({}) 落后于应有位置 ({}) 已持续 {} 个巡逻周期。\n浮盈保护可能未生效, 建议立即手动核对/调整止损, 并查服务器日志:\nsudo journalctl -u matrix-quant | grep 棘轮 | tail",
+                                    sym, tp.normalize(), desired_px.normalize(), st.ratchet_stuck_cycles)).await;
+                            }
+                        } else {
+                            st.ratchet_stuck_cycles = 0;
+                        }
+                    } else if moved_ok {
+                        st.ratchet_stuck_cycles = 0;
                     }
                 }
                 Err(e) => { error!("🛡 [{}] 查询挂单失败: {}", sym, e); }
