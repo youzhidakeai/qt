@@ -215,11 +215,19 @@ pub async fn run_guardian(
         // ---------- 在场仓位巡逻 ----------
         for (sym, (amt, entry, upnl, mark, lev)) in live {
             if entry <= Decimal::ZERO { continue; }
-            // ROE 阈值按该仓位实际杠杆折算成币价距离
+            // ROE 阈值按该仓位实际杠杆折算成币价距离。
+            // 杠杆归一: ROE 阈值以 10x 为基准定义, 更高杠杆自动等比放大,
+            // 保证币价距离一致 —— 否则 20x 下 ROE+10 只等于币价 0.5%,
+            // 激活和回吐全部落在分钟级噪音里 (硬止损同理会被正常回踩打掉)。
+            // 放大后的止损 ROE 封顶 60, 永不逼近强平线 (强平约 ROE -95)。
             let lev = lev.max(Decimal::ONE);
-            let stop_pct = stop_roe / lev;
-            let trail_arm = arm_roe / lev;
-            let trail_pct = trail_roe / lev;
+            let lev_scale = (lev / dec!(10)).max(Decimal::ONE);
+            let stop_roe_eff = (stop_roe * lev_scale).min(dec!(60));
+            let arm_roe_eff = arm_roe * lev_scale;
+            let trail_roe_eff = trail_roe * lev_scale;
+            let stop_pct = stop_roe_eff / lev;
+            let trail_arm = arm_roe_eff / lev;
+            let trail_pct = trail_roe_eff / lev;
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
             let opened_key = format!("GUARD_OPENED_{}", sym);
             // SETNX: 只在首次发现时记录开仓时间, 引擎重启不清零
@@ -268,7 +276,7 @@ pub async fn run_guardian(
                     info!("🔒 [{}] 移动止盈已激活 (ROE {:+}%, {}x), 从最优价回撤币价 {:.2}% 落袋", sym, profit_roe, lev, trail_pct);
                     let _ = tg_tx.send(format!(
                         "🔒 <b>【移动止盈已激活】</b> {}\n\n当前浮盈: ROE <b>{:+}%</b> (已过激活线 ROE {}%, 杠杆 {}x)\n从此上不封顶: 止损将跟随最高点上移, ROE 从峰值回吐 {}% 自动落袋\n目标保底出场价: <b>{}</b>\n⚠️ 以交易所实际挂单为准: 止损单实际搬到位后会另发【止损已实际上移】确认, 没收到确认前保底不生效",
-                        sym, profit_roe, arm_roe, lev, trail_roe, floor_px.round_dp(6).normalize())).await;
+                        sym, profit_roe, arm_roe_eff.normalize(), lev, trail_roe_eff.normalize(), floor_px.round_dp(6).normalize())).await;
                 }
             }
 
@@ -428,8 +436,8 @@ pub async fn run_guardian(
                                 } else {
                                     // 触发时的预计亏损 = 仓位数量 × |均价 - 止损价| (市价成交, 滑点另计)
                                     let est_loss = (amt.abs() * (entry - stop_px).abs()).round_dp(2).normalize();
-                                    info!("🛡 [{}] 已挂交易所侧硬止损 @ {} (均价 {}, ROE -{}% / 币价 -{:.2}%, 预计亏损 {}U)", sym, stop_str, entry.normalize(), stop_roe, stop_pct, est_loss);
-                                    let _ = tg_tx.send(format!("🛡 <b>【保镖已就位】</b>\n\n交易对: {}\n方向: {} ({}x)\n开仓均价: {}\n硬止损已挂在交易所: <b>{}</b> (ROE -{}% / 币价 -{:.2}%)\n触发预计亏损: <b>-{} U</b> (不含滑点)\n浮盈过 ROE {}% 后自动切换移动止盈模式\n\n即使引擎断电, 这张止损单也会由币安执行, 强平不可能发生。", sym, if is_long { "🟢 多" } else { "🔴 空" }, lev, entry.round_dp(6).normalize(), stop_str, stop_roe, stop_pct, est_loss, arm_roe)).await;
+                                    info!("🛡 [{}] 已挂交易所侧硬止损 @ {} (均价 {}, ROE -{}% / 币价 -{:.2}%, 预计亏损 {}U)", sym, stop_str, entry.normalize(), stop_roe_eff.normalize(), stop_pct, est_loss);
+                                    let _ = tg_tx.send(format!("🛡 <b>【保镖已就位】</b>\n\n交易对: {}\n方向: {} ({}x)\n开仓均价: {}\n硬止损已挂在交易所: <b>{}</b> (ROE -{}% / 币价 -{:.2}%)\n触发预计亏损: <b>-{} U</b> (不含滑点)\n浮盈过 ROE {}% 后自动切换移动止盈模式\n\n即使引擎断电, 这张止损单也会由币安执行, 强平不可能发生。", sym, if is_long { "🟢 多" } else { "🔴 空" }, lev, entry.round_dp(6).normalize(), stop_str, stop_roe_eff.normalize(), stop_pct, est_loss, arm_roe_eff.normalize())).await;
                                 }
                             }
                             Err(e) => {
