@@ -358,14 +358,27 @@ pub async fn run_guardian(
                         let side = if is_long { "SELL" } else { "BUY" };
                         let stop_px = desired_px;
                         let stop_str = stop_px.normalize().to_string();
-                        match exec.place_stop_market_close(&sym, side, &stop_str).await {
+                        // 币安硬性限制 (-4130): 同方向只允许一张 closePosition 条件单,
+                        // "先挂新后撤旧"物理上不可能 (EVAA/BLUR 卡死的实锤根因)。
+                        // 必须先撤后挂; 裸奔窗口两层兜底: ①同循环毫秒级衔接+挂单失败连试3次
+                        // ②移动止盈主扳机(引擎直接市价平仓)完全不依赖这张单
+                        if let Some(old) = replace_old {
+                            if let Err(e) = exec.cancel_algo_order(old).await {
+                                info!("🛡 [{}] 旧止损单 #{} 撤销失败 (可能已触发/已撤): {}", sym, old, e);
+                            }
+                        }
+                        let mut placed: Result<u64, String> = Err(String::new());
+                        for attempt in 0..3u8 {
+                            placed = exec.place_stop_market_close(&sym, side, &stop_str).await;
+                            if placed.is_ok() {
+                                break;
+                            }
+                            if attempt < 2 {
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            }
+                        }
+                        match placed {
                             Ok(oid) => {
-                                // 新单已就位, 现在才撤旧单 (撤失败无害: 更远的旧单触发时仓位已平, 空转)
-                                if let Some(old) = replace_old {
-                                    if let Err(e) = exec.cancel_algo_order(old).await {
-                                        info!("🛡 [{}] 旧止损单 #{} 撤销失败 (可能已触发/已撤): {}", sym, old, e);
-                                    }
-                                }
                                 st.own_stop_id = Some(oid);
                                 st.entry_used = entry;
                                 st.stop_price = stop_px;
@@ -390,15 +403,14 @@ pub async fn run_guardian(
                                 }
                             }
                             Err(e) => {
-                                if replace_old.is_some() {
-                                    // 棘轮换单失败, 但旧止损单还在场, 仓位仍有保护 (下一轮重试)
-                                    error!("🛡 [{}] 棘轮换挂新止损失败 (旧单仍生效): {}", sym, e);
-                                } else {
-                                    error!("🛡 [{}] 挂硬止损失败: {}", sym, e);
-                                    if !st.stop_error_notified {
-                                        st.stop_error_notified = true;
-                                        let _ = tg_tx.send(format!("⚠️ <b>【保镖告警】</b> {} 挂硬止损失败, 该仓位当前无保护!\n原因: {}", sym, e)).await;
-                                    }
+                                // 先撤后挂模式下, 挂新失败 = 旧单已撤、仓位暂时裸奔 (3次重试都失败才会到这)。
+                                // 下一轮巡逻会按"无止损"路径重新挂; 已激活仓位另有直接市价扳机兜底。
+                                st.own_stop_id = None;
+                                st.stop_price = Decimal::ZERO;
+                                error!("🛡 [{}] 挂止损失败 (3次重试后), 仓位暂时无止损单: {}", sym, e);
+                                if !st.stop_error_notified {
+                                    st.stop_error_notified = true;
+                                    let _ = tg_tx.send(format!("⚠️ <b>【保镖告警】</b> {} 挂止损失败, 该仓位暂时无止损单 (每10秒自动重挂; 已激活的移动止盈不受影响)!\n原因: {}", sym, e)).await;
                                 }
                             }
                         }
