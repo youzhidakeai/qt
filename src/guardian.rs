@@ -45,6 +45,9 @@ struct GuardState {
     // 移动止盈主扳机是否已发出平仓单 (防止重复市价单)
     #[serde(default)]
     trail_exit_fired: bool,
+    // 持仓期峰值 ROE 快照 (随巡逻更新, 仓位了结时归档进滚动统计)
+    #[serde(default)]
+    peak_roe: Decimal,
     last_hold_alert_min: u64,
     stop_error_notified: bool,
     auto_close_attempted: bool,
@@ -52,7 +55,7 @@ struct GuardState {
 
 impl Default for GuardState {
     fn default() -> Self {
-        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, ratchet_stuck_cycles: 0, trail_exit_fired: false, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
+        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, ratchet_stuck_cycles: 0, trail_exit_fired: false, peak_roe: Decimal::ZERO, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
     }
 }
 
@@ -164,8 +167,18 @@ pub async fn run_guardian(
                         }
                         let held_min = now_ms.saturating_sub(opened_at) / 60_000;
                         let emoji = if realized >= Decimal::ZERO { "🟢" } else { "🔴" };
-                        let was_armed = states.get(&sym).map(|s| s.trail_armed).unwrap_or(false);
-                        let how = if was_armed { "移动止盈/手动" } else { "止损/手动" };
+                        let (was_armed, peak_roe_rec, direct_exit) = states.get(&sym)
+                            .map(|s| (s.trail_armed, s.peak_roe, s.trail_exit_fired))
+                            .unwrap_or((false, Decimal::ZERO, false));
+                        let how = if direct_exit { "移动止盈直接落袋" } else if was_armed { "止损单落袋(已激活)/手动" } else { "止损/手动" };
+                        // 滚动实时统计档案: 参数讨论只准引用这里的数据, 不准再用历史回测
+                        let rec = serde_json::json!({
+                            "sym": sym, "ts": now_ms, "held_min": held_min,
+                            "realized": realized.to_string(), "peak_roe": peak_roe_rec.to_string(),
+                            "armed": was_armed, "direct_exit": direct_exit,
+                        });
+                        let _: () = redis::cmd("LPUSH").arg("GUARD_TRADE_LOG").arg(rec.to_string()).query_async(&mut con).await.unwrap_or(());
+                        let _: () = redis::cmd("LTRIM").arg("GUARD_TRADE_LOG").arg(0).arg(199).query_async(&mut con).await.unwrap_or(());
                         let _ = tg_tx.send(format!(
                             "🔓 <b>【仓位已了结】</b> {} {}\n持仓 {} 分钟 | 已实现盈亏: <b>{:+.2} U</b>{}\n出场方式: {} (交易所侧成交或手动)",
                             emoji, sym, held_min, realized.round_dp(2).normalize(),
@@ -216,6 +229,7 @@ pub async fn run_guardian(
                 }
                 // ROE 里程碑播报: 用 peak (只升不降) 而非当前 mark, 语义是"曾经到过", 不随价格回落取消
                 let peak_roe = if is_long { (st.peak - entry) / entry * dec!(100) * lev } else { (entry - st.peak) / entry * dec!(100) * lev };
+                st.peak_roe = peak_roe; // 档案快照: 了结时写入滚动统计
                 for &lvl in ROE_MILESTONES.iter() {
                     if peak_roe >= Decimal::from(lvl) && st.last_milestone_roe < lvl {
                         st.last_milestone_roe = lvl;

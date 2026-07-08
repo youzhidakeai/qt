@@ -727,6 +727,49 @@ async fn answer(
                         pos_lines
                     )
                 }
+                ["stats"] => {
+                    // 滚动实时统计: 只统计最近7天真实了结的仓位 —— 参数讨论的唯一合法数据源
+                    let raw: Vec<String> = redis::cmd("LRANGE").arg("GUARD_TRADE_LOG").arg(0).arg(199).query_async(&mut con).await.unwrap_or_default();
+                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let week_ago = now_ms.saturating_sub(7 * 24 * 3600 * 1000);
+                    let mut n = 0u32;
+                    let mut armed_n = 0u32;
+                    let mut direct_n = 0u32;
+                    let mut total_pnl = 0.0f64;
+                    let mut peaks: Vec<f64> = Vec::new();
+                    let mut recent_lines = String::new();
+                    for (i, s) in raw.iter().enumerate() {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else { continue };
+                        let ts = v["ts"].as_u64().unwrap_or(0);
+                        if ts < week_ago { continue; }
+                        n += 1;
+                        let armed = v["armed"].as_bool().unwrap_or(false);
+                        let direct = v["direct_exit"].as_bool().unwrap_or(false);
+                        if armed { armed_n += 1; }
+                        if direct { direct_n += 1; }
+                        let pnl: f64 = v["realized"].as_str().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                        let peak: f64 = v["peak_roe"].as_str().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+                        total_pnl += pnl;
+                        peaks.push(peak);
+                        if i < 5 {
+                            recent_lines.push_str(&format!("  • {} 峰值{:+.1}% {} 盈亏{:+.2}U\n",
+                                v["sym"].as_str().unwrap_or("?"), peak,
+                                if direct { "🎯直接落袋" } else if armed { "🔒激活" } else { "—" }, pnl));
+                        }
+                    }
+                    if n == 0 {
+                        "📊 最近 7 天没有已了结的受监护仓位, 统计空白。".to_string()
+                    } else {
+                        peaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let median_peak = peaks[peaks.len() / 2];
+                        let reach10 = peaks.iter().filter(|p| **p >= 10.0).count();
+                        format!(
+                            "📊 <b>保镖滚动实况 (最近7天, {}单)</b>\n\n激活率: {}/{} ({:.0}%) | 峰值曾过+10%: {}/{} ({:.0}%)\n峰值ROE中位数: {:+.1}%\n移动止盈直接落袋: {} 次\n合计已实现: <b>{:+.2}U</b>\n\n最近5单:\n{}\n💡 当下市场的真实数据, 参数讨论以此为准。",
+                            n, armed_n, n, 100.0 * armed_n as f64 / n as f64,
+                            reach10, n, 100.0 * reach10 as f64 / n as f64,
+                            median_peak, direct_n, total_pnl, recent_lines)
+                    }
+                }
                 ["on"] => {
                     set(&mut con, "GUARD_ENABLED", "1".into()).await;
                     "🛡 保镖已开启，10 秒内开始巡逻。".to_string()
