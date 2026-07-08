@@ -340,8 +340,12 @@ pub async fn run_guardian(
                                 // 自愈: 卡住检测已计数 ≥2 轮时无条件强制换单一次, 不再信任任何判断
                                 let force_retry = st.ratchet_stuck_cycles >= 2 && st.trail_armed;
                                 let improved = improved || force_retry;
-                                let drifted = !st.trail_armed && st.entry_used > Decimal::ZERO
-                                    && ((entry - st.entry_used).abs() / entry) > dec!(0.005);
+                                // 未激活时: 止损必须锚定当前均价。比较"交易所实际触发价"和
+                                // "按当前均价应在的位置", 偏差超 0.2% 即重挂 (方向不限, 加仓摊高
+                                // 摊低都跟)。旧逻辑用 0.5% 均价漂移做死区, 小幅加仓会被无视,
+                                // 用户观察到"止损只认第一次买入价"就是这个死区+4130联手造成的
+                                let drifted = !st.trail_armed && baseline > Decimal::ZERO
+                                    && ((desired_px - baseline).abs() / baseline) > dec!(0.002);
                                 if improved || drifted {
                                     // 先挂新单、成功后再撤旧单 —— 撤单在前的顺序在"撤成功+挂失败"
                                     // 时会留下无保护窗口 (仓位裸奔), 顺序在此不可反转
