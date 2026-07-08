@@ -11,6 +11,7 @@ mod funding;
 mod grid_scanner;
 mod grid_paper;
 mod grid_live;
+mod manip_radar;
 mod spot;
 mod paper;
 
@@ -679,6 +680,16 @@ async fn main() {
     let grid_paper_tg = tg_tx.clone();
     tokio::spawn(async move {
         grid_paper::run_grid_paper(grid_paper_redis, grid_paper_tg).await;
+    });
+
+    // ==========================================
+    // MODULE: 操纵嫌疑雷达 (影子模式, 只警告不拦截)
+    // ==========================================
+    let radar_exec = exec_client.clone();
+    let radar_redis = redis_client.clone();
+    let radar_tg = tg_tx.clone();
+    tokio::spawn(async move {
+        manip_radar::run_manip_radar(radar_exec, radar_redis, radar_tg).await;
     });
 
     // ==========================================
