@@ -157,12 +157,15 @@ pub async fn run_guardian(
         for key in tracked {
             let sym = key.trim_start_matches("GUARD_OPENED_").to_string();
             if live.contains_key(&sym) { continue; }
+            // 遗留止损单还挂着 = 仓位不是被它平的 (手动或直接扳机); 不在了 = 它成交的
+            let mut leftover_stop_found = false;
             if let Ok(orders_str) = exec.get_open_algo_orders(&sym).await {
                 if let Ok(orders) = serde_json::from_str::<Vec<serde_json::Value>>(&orders_str) {
                     for o in orders {
                         let is_close_stop = o.get("closePosition").and_then(|v| v.as_bool()).unwrap_or(false)
                             && o.get("orderType").and_then(|v| v.as_str()).unwrap_or("") == "STOP_MARKET";
                         if is_close_stop {
+                            leftover_stop_found = true;
                             if let Some(oid) = o.get("algoId").and_then(|v| v.as_u64()) {
                                 let _ = exec.cancel_algo_order(oid).await;
                                 info!("🛡 [{}] 仓位已平, 撤掉遗留止损挂单 #{}", sym, oid);
@@ -192,12 +195,21 @@ pub async fn run_guardian(
                         let (was_armed, peak_roe_rec, direct_exit) = states.get(&sym)
                             .map(|s| (s.trail_armed, s.peak_roe, s.trail_exit_fired))
                             .unwrap_or((false, Decimal::ZERO, false));
-                        let how = if direct_exit { "移动止盈直接落袋" } else if was_armed { "止损单落袋(已激活)/手动" } else { "止损/手动" };
+                        // 精确归因: 直接扳机开过火 > 止损单还在(说明是手动平的) > 止损单没了(它成交的)
+                        let how = if direct_exit {
+                            "移动止盈直接落袋"
+                        } else if leftover_stop_found {
+                            "手动平仓"
+                        } else if was_armed {
+                            "移动止盈(止损单成交)"
+                        } else {
+                            "硬止损成交"
+                        };
                         // 滚动实时统计档案: 参数讨论只准引用这里的数据, 不准再用历史回测
                         let rec = serde_json::json!({
                             "sym": sym, "ts": now_ms, "held_min": held_min,
                             "realized": realized.to_string(), "peak_roe": peak_roe_rec.to_string(),
-                            "armed": was_armed, "direct_exit": direct_exit,
+                            "armed": was_armed, "direct_exit": direct_exit, "exit": how,
                         });
                         let _: () = redis::cmd("LPUSH").arg("GUARD_TRADE_LOG").arg(rec.to_string()).query_async(&mut con).await.unwrap_or(());
                         let _: () = redis::cmd("LTRIM").arg("GUARD_TRADE_LOG").arg(0).arg(199).query_async(&mut con).await.unwrap_or(());
