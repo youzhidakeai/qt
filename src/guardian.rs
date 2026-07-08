@@ -48,6 +48,10 @@ struct GuardState {
     // 持仓期峰值 ROE 快照 (随巡逻更新, 仓位了结时归档进滚动统计)
     #[serde(default)]
     peak_roe: Decimal,
+    // 激活那一刻的均价: 比例回吐的冻结参考 —— 落袋线用它而非实时均价计算,
+    // 否则激活后加仓会拖着均价走, 落袋线跟着漂移, "锁定"变成空话 (用户实测抓包)
+    #[serde(default)]
+    arm_entry: Decimal,
     last_hold_alert_min: u64,
     stop_error_notified: bool,
     auto_close_attempted: bool,
@@ -55,7 +59,7 @@ struct GuardState {
 
 impl Default for GuardState {
     fn default() -> Self {
-        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, ratchet_stuck_cycles: 0, trail_exit_fired: false, peak_roe: Decimal::ZERO, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
+        Self { own_stop_id: None, entry_used: Decimal::ZERO, stop_price: Decimal::ZERO, peak: Decimal::ZERO, trail_armed: false, last_milestone_roe: 0, trail_confirm_sent: false, ratchet_stuck_cycles: 0, trail_exit_fired: false, peak_roe: Decimal::ZERO, arm_entry: Decimal::ZERO, last_hold_alert_min: 0, stop_error_notified: false, auto_close_attempted: false }
     }
 }
 
@@ -315,9 +319,22 @@ pub async fn run_guardian(
                 }
 
                 let profit_pct = if is_long { (mark - entry) / entry * dec!(100) } else { (entry - mark) / entry * dec!(100) };
+                // 激活后均价变化侦测 (加仓/减仓): 落袋线不动, 但锁定金额被稀释/浓缩, 实时播报真相
+                if st.trail_armed && st.entry_used > Decimal::ZERO && ((entry - st.entry_used).abs() / entry) > dec!(0.003) {
+                    let anchor = if st.arm_entry > Decimal::ZERO { st.arm_entry } else { entry };
+                    let floor_now = trail_floor_px(is_long, anchor, st.peak, lev, trail_pct, giveback_pct);
+                    let locked_now = (amt.abs() * (floor_now - entry) * if is_long { Decimal::ONE } else { dec!(-1) }).round_dp(2).normalize();
+                    st.entry_used = entry;
+                    let _ = tg_tx.send(format!(
+                        "⚖️ <b>【加/减仓已侦测】</b> {}\n均价变为 {} | 落袋线保持 <b>{}</b> 不变\n按当前全部仓位重算的锁定盈亏: <b>{:+} U</b>\n(加仓会稀释锁定额, 减仓会浓缩它 —— 线不动, 账实时更新)",
+                        sym, entry.round_dp(6).normalize(), floor_now.round_dp(6).normalize(), locked_now)).await;
+                }
+
                 if trail_on && !st.trail_armed && profit_pct >= trail_arm {
                     st.trail_armed = true;
-                    let floor_px = trail_floor_px(is_long, entry, st.peak, lev, trail_pct, giveback_pct);
+                    st.arm_entry = entry; // 冻结: 之后加仓不再影响落袋线
+                    let anchor = if st.arm_entry > Decimal::ZERO { st.arm_entry } else { entry };
+                    let floor_px = trail_floor_px(is_long, anchor, st.peak, lev, trail_pct, giveback_pct);
                     let profit_roe = (profit_pct * lev).round_dp(1).normalize();
                     info!("🔒 [{}] 移动止盈已激活 (ROE {:+}%, {}x), 从最优价回撤币价 {:.2}% 落袋", sym, profit_roe, lev, trail_pct);
                     let _ = tg_tx.send(format!(
@@ -331,7 +348,8 @@ pub async fn run_guardian(
             // 已激活 + 标记价跌破回吐线 → 保镖直接市价平仓落袋 (reduceOnly, 只减不开)。
             // 交易所侧止损单降级为引擎宕机时的兜底, 搬单成败不再决定卖出与否。
             if trail_on && st.trail_armed && !st.trail_exit_fired && mark > Decimal::ZERO && st.peak > Decimal::ZERO {
-                let floor = trail_floor_px(is_long, entry, st.peak, lev, trail_pct, giveback_pct);
+                let anchor = if st.arm_entry > Decimal::ZERO { st.arm_entry } else { entry };
+                let floor = trail_floor_px(is_long, anchor, st.peak, lev, trail_pct, giveback_pct);
                 let crossed = if is_long { mark <= floor } else { mark >= floor };
                 if crossed {
                     let side = if is_long { "SELL" } else { "BUY" };
@@ -375,7 +393,8 @@ pub async fn run_guardian(
                         entry * (Decimal::ONE + stop_pct / dec!(100))
                     };
                     let raw_desired = if trail_on && st.trail_armed {
-                        let trail_line = trail_floor_px(is_long, entry, st.peak, lev, trail_pct, giveback_pct);
+                        let anchor = if st.arm_entry > Decimal::ZERO { st.arm_entry } else { entry };
+                        let trail_line = trail_floor_px(is_long, anchor, st.peak, lev, trail_pct, giveback_pct);
                         if is_long { disaster.max(trail_line) } else { disaster.min(trail_line) }
                     } else {
                         disaster
