@@ -803,6 +803,12 @@ async fn answer(
                         _ => "❌ 无效参数。例: /guard alert 30".to_string(),
                     }
                 }
+                ["autotune", v] if *v == "on" || *v == "off" => {
+                    let on = *v == "on";
+                    set(&mut con, "GUARD_AUTO_TUNE", if on { "1".into() } else { "0".into() }).await;
+                    if on { "🎛 自适应调参已开: 激活线每小时按最近20单峰值中位数自动校准 (界内7~25, 单次±2, 每次调整会播报)。".to_string() }
+                    else { "⏸ 自适应调参已关: 激活线固定为当前值, 手动 /guard trail 管理。".to_string() }
+                }
                 ["giveback", "off"] => {
                     set(&mut con, "GUARD_TRAIL_GIVEBACK_PCT", "0".into()).await;
                     "✅ 比例回吐已关闭, 回到固定回吐模式 (/guard trail 的第二个参数)。".to_string()
@@ -831,6 +837,8 @@ async fn answer(
                             set(&mut con, "GUARD_TRAIL_ARM_ROE", arm.to_string()).await;
                             set(&mut con, "GUARD_TRAIL_ROE", pct.to_string()).await;
                             set(&mut con, "GUARD_TRAIL_ENABLED", "1".into()).await;
+                            // 手动定参 = 用户意志优先, 自动关掉自适应防止被悄悄覆盖
+                            set(&mut con, "GUARD_AUTO_TUNE", "0".into()).await;
                             format!("🔒 移动止盈已设为: ROE +{}% 激活, 峰值回吐 ROE {}% 落袋 (按各仓位杠杆自动折算币价)。收到【止损已实际上移】确认后, 该仓位最差保本出场。", a, p)
                         }
                         _ => "❌ 无效参数 (ROE 百分比)。要求: 激活 &gt; 回吐, 例: /guard trail 20 15".to_string(),
@@ -849,7 +857,7 @@ async fn answer(
                         _ => "❌ 无效参数。例: /guard autoclose 60 或 /guard autoclose off".to_string(),
                     }
                 }
-                _ => "用法 (百分比一律按 ROE, 即 App 显示的收益率):\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 50 - 硬止损 ROE -50%\n/guard trail 20 15 - 移动止盈: ROE +20% 激活, 峰值回吐 15% 落袋\n/guard giveback 30 - 比例回吐: 回吐峰值的30% (低峰紧高峰宽)\n/guard giveback off - 回到固定回吐\n/guard trail on|off - 移动止盈开关\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
+                _ => "用法 (百分比一律按 ROE, 即 App 显示的收益率):\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 50 - 硬止损 ROE -50%\n/guard trail 20 15 - 移动止盈: ROE +20% 激活, 峰值回吐 15% 落袋\n/guard giveback 30 - 比例回吐: 回吐峰值的30% (低峰紧高峰宽)\n/guard autotune on|off - 激活线自适应调参 (手动 trail 会自动关它)\n/guard giveback off - 回到固定回吐\n/guard trail on|off - 移动止盈开关\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }

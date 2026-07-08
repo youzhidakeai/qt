@@ -134,6 +134,37 @@ pub async fn run_guardian(
         // 低峰值时更紧(保本更实: 激活后最差 = 激活线×(1-N%)), 高峰值时缓冲更宽(拿得住主升浪)。
         let giveback_pct = Decimal::from_str(&read_cfg(&mut con, "GUARD_TRAIL_GIVEBACK_PCT", "0").await).unwrap_or(Decimal::ZERO);
 
+        // ---------- 自适应激活线 (程序自调参; /guard autotune off 关闭) ----------
+        // 纪律: 每小时最多一次 / 目标=最近20单峰值中位数×0.6 / 界内[7,25] / 单次最多±2 / 每次调整TG播报
+        if read_cfg(&mut con, "GUARD_AUTO_TUNE", "1").await == "1" {
+            let now_t = time::OffsetDateTime::now_utc().to_offset(time::UtcOffset::from_hms(8, 0, 0).unwrap());
+            let hour_bucket = format!("{:04}-{:02}-{:02}-{:02}", now_t.year(), now_t.month() as u8, now_t.day(), now_t.hour());
+            let done = read_cfg(&mut con, "GUARD_AUTOTUNE_HOUR", "").await;
+            if done != hour_bucket {
+                let _: () = redis::cmd("SET").arg("GUARD_AUTOTUNE_HOUR").arg(&hour_bucket).query_async(&mut con).await.unwrap_or(());
+                let raw: Vec<String> = redis::cmd("LRANGE").arg("GUARD_TRADE_LOG").arg(0).arg(19).query_async(&mut con).await.unwrap_or_default();
+                let mut peaks: Vec<f64> = raw.iter()
+                    .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter_map(|v| v["peak_roe"].as_str().and_then(|x| x.parse::<f64>().ok()))
+                    .collect();
+                if peaks.len() >= 10 {
+                    peaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let median = peaks[peaks.len() / 2];
+                    let target = (median * 0.6).clamp(7.0, 25.0).round();
+                    let cur: f64 = read_cfg(&mut con, "GUARD_TRAIL_ARM_ROE", "10").await.parse().unwrap_or(10.0);
+                    let step = (target - cur).clamp(-2.0, 2.0);
+                    let newv = (cur + step).round();
+                    if (newv - cur).abs() >= 1.0 {
+                        let _: () = redis::cmd("SET").arg("GUARD_TRAIL_ARM_ROE").arg(newv.to_string()).query_async(&mut con).await.unwrap_or(());
+                        info!("🎛 [自适应] 激活线 {} -> {} (近{}单峰值中位数 {:.1})", cur, newv, peaks.len(), median);
+                        let _ = tg_tx.send(format!(
+                            "🎛 <b>【自适应调参】</b> 移动止盈激活线: ROE +{} → <b>+{}</b>\n依据: 最近 {} 单峰值中位数 {:+.1}% (目标=中位数×0.6, 界内[7,25], 单次最多±2)\n关闭自动调参: /guard autotune off",
+                            cur, newv, peaks.len(), median)).await;
+                    }
+                }
+            }
+        }
+
         let pos_str = match exec.check_positions().await {
             Ok(s) => s,
             Err(e) => { error!("🛡 保镖拉取仓位失败: {}", e); continue; }
