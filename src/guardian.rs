@@ -105,9 +105,10 @@ pub async fn run_guardian(
     let mut states: HashMap<String, GuardState> = HashMap::new();
 
     loop {
-        // 3秒巡逻: 10秒采样在急拉急跌里让止损位平均滞后半个周期, 实测每单吃掉
-        // 2~5 个 ROE 点 (峰值31的单只落袋15的主因之一)。API 权重预算充足。
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // 1秒巡逻: 币安标记价格本身每秒更新一次, 1s 轮询已贴住物理上限,
+        // 与 websocket 推送等效 (滞后税从10s时代的2~5个ROE点压到<1个点)。
+        // API 权重 ~400/分钟, 预算 2400 充足。ws 重构留待需要亚秒级时再做。
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let mut con = match redis_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -386,7 +387,7 @@ pub async fn run_guardian(
                                     desired_px < baseline * dec!(0.999)
                                 };
                                 // 自愈: 卡住检测已计数 ≥2 轮时无条件强制换单一次, 不再信任任何判断
-                                let force_retry = st.ratchet_stuck_cycles >= 5 && st.trail_armed;
+                                let force_retry = st.ratchet_stuck_cycles >= 15 && st.trail_armed;
                                 let improved = improved || force_retry;
                                 // 未激活时: 止损必须锚定当前均价。比较"交易所实际触发价"和
                                 // "按当前均价应在的位置", 偏差超 0.2% 即重挂 (方向不限, 加仓摊高
@@ -478,7 +479,7 @@ pub async fn run_guardian(
                         }).unwrap_or(false);
                         if lagging {
                             st.ratchet_stuck_cycles += 1;
-                            if st.ratchet_stuck_cycles == 10 || st.ratchet_stuck_cycles % 300 == 0 {
+                            if st.ratchet_stuck_cycles == 30 || st.ratchet_stuck_cycles % 900 == 0 {
                                 let tp = existing_trigger.unwrap_or_default();
                                 error!("🛡 [{}] 棘轮疑似卡住: 交易所止损 {} 落后于应有 {} 已 {} 轮", sym, tp.normalize(), desired_px.normalize(), st.ratchet_stuck_cycles);
                                 let _ = tg_tx.send(format!(
