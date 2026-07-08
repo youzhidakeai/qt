@@ -67,6 +67,23 @@ async fn read_cfg(con: &mut redis::aio::MultiplexedConnection, key: &str, defaul
 }
 
 // 止损价对齐 tick_size；多单止损向下取整、空单止损向上取整，保证不会因精度被拒单
+// 追踪出场线: 比例回吐模式下 = 峰值ROE×(1-N%) 折回价格; 否则固定回吐 trail_pct(币价%)
+fn trail_floor_px(is_long: bool, entry: Decimal, peak: Decimal, lev: Decimal, trail_pct: Decimal, giveback_pct: Decimal) -> Decimal {
+    if giveback_pct > Decimal::ZERO && entry > Decimal::ZERO {
+        let peak_roe = if is_long { (peak - entry) / entry * dec!(100) * lev } else { (entry - peak) / entry * dec!(100) * lev };
+        let floor_roe = peak_roe * (Decimal::ONE - giveback_pct / dec!(100));
+        if is_long {
+            entry * (Decimal::ONE + floor_roe / (dec!(100) * lev))
+        } else {
+            entry * (Decimal::ONE - floor_roe / (dec!(100) * lev))
+        }
+    } else if is_long {
+        peak * (Decimal::ONE - trail_pct / dec!(100))
+    } else {
+        peak * (Decimal::ONE + trail_pct / dec!(100))
+    }
+}
+
 fn align_to_tick(px: Decimal, tick: Option<Decimal>, round_down: bool) -> Decimal {
     match tick {
         Some(t) if t > Decimal::ZERO => {
@@ -110,6 +127,9 @@ pub async fn run_guardian(
         let trail_on = read_cfg(&mut con, "GUARD_TRAIL_ENABLED", "1").await == "1";
         let arm_roe = Decimal::from_str(&read_cfg(&mut con, "GUARD_TRAIL_ARM_ROE", "20").await).unwrap_or(dec!(20));
         let trail_roe = Decimal::from_str(&read_cfg(&mut con, "GUARD_TRAIL_ROE", "15").await).unwrap_or(dec!(15));
+        // 比例回吐模式 (>0 时生效, 覆盖固定回吐): 回吐"峰值ROE的N%"而非固定点数。
+        // 低峰值时更紧(保本更实: 激活后最差 = 激活线×(1-N%)), 高峰值时缓冲更宽(拿得住主升浪)。
+        let giveback_pct = Decimal::from_str(&read_cfg(&mut con, "GUARD_TRAIL_GIVEBACK_PCT", "0").await).unwrap_or(Decimal::ZERO);
 
         let pos_str = match exec.check_positions().await {
             Ok(s) => s,
@@ -243,7 +263,7 @@ pub async fn run_guardian(
                 let profit_pct = if is_long { (mark - entry) / entry * dec!(100) } else { (entry - mark) / entry * dec!(100) };
                 if trail_on && !st.trail_armed && profit_pct >= trail_arm {
                     st.trail_armed = true;
-                    let floor_px = if is_long { st.peak * (Decimal::ONE - trail_pct / dec!(100)) } else { st.peak * (Decimal::ONE + trail_pct / dec!(100)) };
+                    let floor_px = trail_floor_px(is_long, entry, st.peak, lev, trail_pct, giveback_pct);
                     let profit_roe = (profit_pct * lev).round_dp(1).normalize();
                     info!("🔒 [{}] 移动止盈已激活 (ROE {:+}%, {}x), 从最优价回撤币价 {:.2}% 落袋", sym, profit_roe, lev, trail_pct);
                     let _ = tg_tx.send(format!(
@@ -257,11 +277,7 @@ pub async fn run_guardian(
             // 已激活 + 标记价跌破回吐线 → 保镖直接市价平仓落袋 (reduceOnly, 只减不开)。
             // 交易所侧止损单降级为引擎宕机时的兜底, 搬单成败不再决定卖出与否。
             if trail_on && st.trail_armed && !st.trail_exit_fired && mark > Decimal::ZERO && st.peak > Decimal::ZERO {
-                let floor = if is_long {
-                    st.peak * (Decimal::ONE - trail_pct / dec!(100))
-                } else {
-                    st.peak * (Decimal::ONE + trail_pct / dec!(100))
-                };
+                let floor = trail_floor_px(is_long, entry, st.peak, lev, trail_pct, giveback_pct);
                 let crossed = if is_long { mark <= floor } else { mark >= floor };
                 if crossed {
                     let side = if is_long { "SELL" } else { "BUY" };
@@ -305,11 +321,7 @@ pub async fn run_guardian(
                         entry * (Decimal::ONE + stop_pct / dec!(100))
                     };
                     let raw_desired = if trail_on && st.trail_armed {
-                        let trail_line = if is_long {
-                            st.peak * (Decimal::ONE - trail_pct / dec!(100))
-                        } else {
-                            st.peak * (Decimal::ONE + trail_pct / dec!(100))
-                        };
+                        let trail_line = trail_floor_px(is_long, entry, st.peak, lev, trail_pct, giveback_pct);
                         if is_long { disaster.max(trail_line) } else { disaster.min(trail_line) }
                     } else {
                         disaster

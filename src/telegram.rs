@@ -695,6 +695,7 @@ async fn answer(
                     let ac = get("GUARD_AUTO_CLOSE_MIN", "0").await;
                     let trail_on = get("GUARD_TRAIL_ENABLED", "1").await;
                     let trail_arm = get("GUARD_TRAIL_ARM_ROE", "20").await;
+                    let giveback = get("GUARD_TRAIL_GIVEBACK_PCT", "0").await;
                     let trail_pct = get("GUARD_TRAIL_ROE", "15").await;
                     let guarded: Vec<String> = redis::cmd("KEYS").arg("GUARD_OPENED_*").query_async(&mut con).await.unwrap_or_default();
                     let mut pos_lines = String::new();
@@ -720,7 +721,13 @@ async fn answer(
                         <b>监护中的仓位:</b>\n{}",
                         if enabled == "1" { "✅ 开启" } else { "⛔️ 关闭" },
                         stop,
-                        if trail_on == "1" { format!("✅ ROE +{}% 激活, 峰值回吐 ROE {}% 落袋", trail_arm, trail_pct) } else { "⛔️ 关闭".to_string() },
+                        if trail_on == "1" {
+                            if giveback != "0" && !giveback.is_empty() {
+                                format!("✅ ROE +{}% 激活, 回吐峰值的 {}% 落袋 (比例模式)", trail_arm, giveback)
+                            } else {
+                                format!("✅ ROE +{}% 激活, 峰值回吐 ROE {}% 落袋", trail_arm, trail_pct)
+                            }
+                        } else { "⛔️ 关闭".to_string() },
                         alert,
                         // HTML parse mode: 裸尖括号会被 Telegram 当非法标签拒收整条消息
                         if ac == "0" { "关闭 (用 /guard autoclose &lt;分钟&gt; 开启)".to_string() } else { format!("{} 分钟", ac) },
@@ -796,6 +803,20 @@ async fn answer(
                         _ => "❌ 无效参数。例: /guard alert 30".to_string(),
                     }
                 }
+                ["giveback", "off"] => {
+                    set(&mut con, "GUARD_TRAIL_GIVEBACK_PCT", "0".into()).await;
+                    "✅ 比例回吐已关闭, 回到固定回吐模式 (/guard trail 的第二个参数)。".to_string()
+                }
+                ["giveback", v] => {
+                    match v.parse::<f64>() {
+                        Ok(p) if (10.0..=60.0).contains(&p) => {
+                            set(&mut con, "GUARD_TRAIL_GIVEBACK_PCT", v.to_string()).await;
+                            let arm: f64 = redis::cmd("GET").arg("GUARD_TRAIL_ARM_ROE").query_async::<Option<String>>(&mut con).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(20.0);
+                            format!("🔒 比例回吐已开启: 从峰值回吐其 {}% 落袋 (低峰值紧、高峰值宽)。\n激活后最差出场 ≈ ROE +{:.1}%; 峰值+50% 时落袋 ≈ +{:.0}%。", p, arm * (1.0 - p / 100.0), 50.0 * (1.0 - p / 100.0))
+                        }
+                        _ => "❌ 无效参数, 范围 10 ~ 60 (回吐峰值的百分比)。例: /guard giveback 30".to_string(),
+                    }
+                }
                 ["trail", "off"] => {
                     set(&mut con, "GUARD_TRAIL_ENABLED", "0".into()).await;
                     "⛔️ 移动止盈已关闭, 只保留固定硬止损。".to_string()
@@ -828,7 +849,7 @@ async fn answer(
                         _ => "❌ 无效参数。例: /guard autoclose 60 或 /guard autoclose off".to_string(),
                     }
                 }
-                _ => "用法 (百分比一律按 ROE, 即 App 显示的收益率):\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 50 - 硬止损 ROE -50%\n/guard trail 20 15 - 移动止盈: ROE +20% 激活, 峰值回吐 15% 落袋\n/guard trail on|off - 移动止盈开关\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
+                _ => "用法 (百分比一律按 ROE, 即 App 显示的收益率):\n/guard status - 查看状态\n/guard on|off - 开关\n/guard stop 50 - 硬止损 ROE -50%\n/guard trail 20 15 - 移动止盈: ROE +20% 激活, 峰值回吐 15% 落袋\n/guard giveback 30 - 比例回吐: 回吐峰值的30% (低峰紧高峰宽)\n/guard giveback off - 回到固定回吐\n/guard trail on|off - 移动止盈开关\n/guard alert 30 - 超时提醒分钟数\n/guard autoclose 60|off - 超时自动平仓".to_string(),
             };
             bot.send_message(msg.chat.id, reply).parse_mode(teloxide::types::ParseMode::Html).await?;
         }
