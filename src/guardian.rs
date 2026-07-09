@@ -210,9 +210,23 @@ pub async fn run_guardian(
                     }
                 }
             }
+            // 报账竞态防护: 1秒巡逻会在币安收益流水入账之前就侦测到仓位归零,
+            // 立刻查账会得到 0 (UAI 实锤: 实际+1.42U 被报成+0.00)。首次侦测只做撤单,
+            // 战报延迟 ≥5 秒再对账。
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            let pending_key = format!("GUARD_PENDING_CLOSE_{}", sym);
+            let pending_since: u64 = redis::cmd("GET").arg(&pending_key).query_async::<Option<String>>(&mut con).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0);
+            if pending_since == 0 {
+                let _: () = redis::cmd("SET").arg(&pending_key).arg(now_ms).arg("EX").arg(120).query_async(&mut con).await.unwrap_or(());
+                continue; // 撤单已完成, 等流水入账后下一轮再报
+            }
+            if now_ms.saturating_sub(pending_since) < 5000 {
+                continue;
+            }
+            let _: () = redis::cmd("DEL").arg(&pending_key).query_async(&mut con).await.unwrap_or(());
+
             // 仓位了结战报: 无论是手动平、止损还是移动止盈成交, 都汇报已实现盈亏
             let opened_at: u64 = redis::cmd("GET").arg(&key).query_async::<Option<String>>(&mut con).await.ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
             if opened_at > 0 {
                 if let Ok(income_str) = exec.get_income_history(opened_at, now_ms).await {
                     if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(&income_str) {
